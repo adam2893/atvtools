@@ -1,0 +1,18 @@
+[package]
+name = "atvtools"
+version = "4.0.0"
+edition = "2021"
+description = "Cross-platform Android TV / Google TV toolbox (Rust port of Android TV Tools v4.0)"
+license = "MIT"
+
+[[bin]]
+name = "atvtools"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+strip = true
+lto = true
