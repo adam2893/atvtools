@@ -68,7 +68,10 @@ const EN: &[(&str, &str)] = &[
     ("lang", "Cambiar a español"),
     ("quit", "quit"),
     ("unknown", "unknown option"),
-    ("serial", "serial (empty = default)"),
+    ("serial", "serial (empty = adb default)"),
+    ("target", "target"),
+    ("default", "adb default"),
+    ("nodev", "no device attached - connect the TV, or press T to set its address"),
     ("done", "done"),
 ];
 
@@ -88,7 +91,10 @@ const ES: &[(&str, &str)] = &[
     ("lang", "Switch to English"),
     ("quit", "salir"),
     ("unknown", "opción desconocida"),
-    ("serial", "serie (vacío = por defecto)"),
+    ("serial", "serie (vacío = la de adb por defecto)"),
+    ("target", "destino"),
+    ("default", "adb por defecto"),
+    ("nodev", "no hay ningun dispositivo - conecta la TV, o pulsa T para dar su direccion"),
     ("done", "hecho"),
 ];
 
@@ -100,15 +106,43 @@ fn ask(prompt: &str) -> Result<String> {
     Ok(s.trim().to_string())
 }
 
-fn adb_for(lang: Lang) -> Result<Adb> {
-    let s = ask(lang.t("serial"))?;
-    Ok(Adb::new(Some(s).filter(|x| !x.is_empty())))
+/// Empty input means "whatever adb picks"; anything else is a host:port serial.
+fn normalize_serial(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() { None } else { Some(s.to_string()) }
+}
+
+/// The TV this session talks to. Asked once; remembered even when the answer was "default".
+#[derive(Default)]
+struct Target {
+    serial: Option<String>,
+    asked: bool,
+}
+
+impl Target {
+    fn adb(&mut self, lang: Lang) -> Result<Adb> {
+        if !self.asked {
+            self.set(ask(lang.t("serial"))?);
+        }
+        Ok(Adb::new(self.serial.clone()))
+    }
+
+    fn set(&mut self, input: String) {
+        self.serial = normalize_serial(&input);
+        self.asked = true;
+    }
+
+    fn label(&self, lang: Lang) -> String {
+        self.serial.clone().unwrap_or_else(|| lang.t("default").to_string())
+    }
 }
 
 pub fn run(lang: &str) -> Result<()> {
     let mut lang = Lang::parse(lang);
+    let mut target = Target::default();
     loop {
-        println!("\n{TITLE}  Android TV Tools{RESET} {DIM}({}){RESET}", lang.t("subtitle"));
+        let where_ = target.label(lang);
+        println!("\n{TITLE}  Android TV Tools{RESET} {DIM}({}){RESET} {DIM}{} {where_}{RESET}", lang.t("subtitle"), lang.t("target"));
         for (k, key) in [
             ("A", "remote"),
             ("B", "adblock"),
@@ -121,25 +155,49 @@ pub fn run(lang: &str) -> Result<()> {
             ("7", "optimize"),
             ("8", "doctor"),
             ("9", "update"),
+            ("T", "target"),
             ("L", "lang"),
         ] {
             println!("  {KEY}{k}{RESET}  {}", lang.t(key));
         }
         println!("  {KEY}q{RESET}  {}", lang.t("quit"));
-        let choice = ask("")?;
-        match choice.as_str() {
-            "q" | "Q" => return Ok(()),
-            "A" | "a" => {
-                let adb = adb_for(lang)?;
-                if let Ok(found) = adb.devices() {
-                    if found.is_empty() {
-                        continue;
-                    }
+        let choice = ask("")?.trim().to_ascii_lowercase();
+        if choice.is_empty() {
+            continue;
+        }
+        if choice == "q" {
+            return Ok(());
+        }
+        if choice == "l" {
+            lang = if lang == Lang::En { Lang::Es } else { Lang::En };
+            println!("{OK}lang = {}{RESET}", lang.code());
+            continue;
+        }
+        if choice == "t" {
+            target.set(ask(lang.t("serial"))?);
+            println!("{OK}{} {}{RESET}", lang.t("target"), target.label(lang));
+            continue;
+        }
+        match action(lang, &mut target, &choice) {
+            Ok(()) => println!("{OK}{}{RESET}", lang.t("done")),
+            Err(e) => println!("{DIM}error: {e}{RESET}"),
+        }
+    }
+}
+
+/// One menu entry. Never exits the program; errors surface in the menu.
+fn action(lang: Lang, target: &mut Target, choice: &str) -> Result<()> {
+    match choice {
+            "a" => {
+                let adb = target.adb(lang)?;
+                if adb.devices().map(|d| d.is_empty()).unwrap_or(false) {
+                    println!("{DIM}{}{RESET}", lang.t("nodev"));
+                    return Ok(());
                 }
                 remote::run(&adb)?;
             }
-            "B" | "b" => {
-                let adb = adb_for(lang)?;
+            "b" => {
+                let adb = target.adb(lang)?;
                 println!("1 private DNS on   2 off   3 state");
                 match ask("")?.as_str() {
                     "1" => settings::adblock_on(&adb)?,
@@ -148,7 +206,7 @@ pub fn run(lang: &str) -> Result<()> {
                 }
             }
             "1" => {
-                let adb = adb_for(lang)?;
+                let adb = target.adb(lang)?;
                 println!("1 push a file   2 pull a file   3 list {}/", crate::transfer::DOWNLOADS);
                 let local = ask("local path")?;
                 match ask("")?.as_str() {
@@ -162,7 +220,7 @@ pub fn run(lang: &str) -> Result<()> {
                 }
             }
             "2" => {
-                let adb = adb_for(lang)?;
+                let adb = target.adb(lang)?;
                 println!("1 list   2 install apk   3 backup all   4 debloat preset");
                 match ask("")?.as_str() {
                     "1" => {
@@ -184,7 +242,7 @@ pub fn run(lang: &str) -> Result<()> {
                 }
             }
             "3" => {
-                let adb = adb_for(lang)?;
+                let adb = target.adb(lang)?;
                 println!("density    = {}", settings::density(&adb)?);
                 println!("font_scale = {}", settings::font_scale(&adb)?);
                 println!("dns        = {}", settings::dns_state(&adb)?);
@@ -195,7 +253,7 @@ pub fn run(lang: &str) -> Result<()> {
                 }
             }
             "4" => {
-                let adb = adb_for(lang)?;
+                let adb = target.adb(lang)?;
                 println!("1 screenshot   2 record   3 scrcpy");
                 match ask("")?.as_str() {
                     "1" => crate::screen::screenshot(&adb, std::path::Path::new("atvtools-shot.png"))?,
@@ -207,12 +265,12 @@ pub fn run(lang: &str) -> Result<()> {
                 println!("{DIM}{}{RESET}", catalog::names());
                 let name = ask("install which app (empty = keep)")?;
                 if !name.is_empty() {
-                    let adb = adb_for(lang)?;
+                    let adb = target.adb(lang)?;
                     crate::download::install_catalog(&adb, &name)?;
                 }
             }
             "6" => {
-                let adb = adb_for(lang)?;
+                let adb = target.adb(lang)?;
                 for c in apps::home_activities(&adb)? {
                     println!("{c}");
                 }
@@ -222,26 +280,41 @@ pub fn run(lang: &str) -> Result<()> {
                 }
             }
             "7" => {
-                let adb = adb_for(lang)?;
+                let adb = target.adb(lang)?;
                 device::optimize(&adb)?;
             }
             "8" => {
-                let adb = adb_for(lang)?;
+                let adb = target.adb(lang)?;
                 crate::doctor::run(&adb)?;
             }
             "9" => crate::update::check(env!("CARGO_PKG_VERSION"), None)?,
-            "L" | "l" => {
-                lang = if lang == Lang::En { Lang::Es } else { Lang::En };
-                println!("{OK}lang = {}{RESET}", lang.code());
-            }
             other => println!("{} {other}", lang.t("unknown")),
-        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_input_is_trimmed_and_empty_means_default() {
+        assert_eq!(normalize_serial(""), None);
+        assert_eq!(normalize_serial("   "), None);
+        assert_eq!(normalize_serial(" 192.168.1.50:5555\n"), Some("192.168.1.50:5555".to_string()));
+    }
+
+    #[test]
+    fn the_target_is_asked_once_even_when_the_answer_is_default() {
+        let mut t = Target::default();
+        assert_eq!(t.label(Lang::En), "adb default");
+        t.set("  ".to_string());              // pressed enter: adb picks the device
+        assert!(t.asked);
+        assert_eq!(t.serial, None);
+        t.set("192.168.1.50:5555".to_string());
+        assert_eq!(t.label(Lang::En), "192.168.1.50:5555");
+        assert_eq!(t.label(Lang::Es), "192.168.1.50:5555");
+    }
 
     #[test]
     fn languages_fall_back_to_the_key() {
