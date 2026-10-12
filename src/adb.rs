@@ -13,6 +13,23 @@ pub struct Adb {
     pub bin: String,
 }
 
+/// The step the user should take, given what adb complained about. Empty when
+/// adb already said something self-explanatory.
+pub fn advice(text: &str) -> &'static str {
+    let t = text.to_ascii_lowercase();
+    if t.contains("unauthorized") {
+        "the TV has not allowed this computer: accept the \"Allow debugging?\" dialog on the TV (never appeared? Developer options > revoke authorisations, then reconnect)"
+    } else if t.contains("more than one device") {
+        "several TVs are attached: choose one with -s <serial>, or press T in the menu"
+    } else if t.contains("device offline") || t.contains("not responding") {
+        "the TV is offline: wake it and reconnect (press C in the menu)"
+    } else if t.contains("no devices") || t.contains("device not found") || t.contains("not found") {
+        "no TV attached: press C in the menu, or run: atvtools connect <tv-ip>"
+    } else {
+        ""
+    }
+}
+
 /// One line of `adb devices -l`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Device {
@@ -47,7 +64,10 @@ impl Adb {
         let stdout = String::from_utf8_lossy(&o.stdout).to_string();
         if !o.status.success() {
             let err = String::from_utf8_lossy(&o.stderr);
-            bail!("adb {} failed: {}{}", argv.join(" "), stdout.trim(), err.trim());
+            let detail = format!("{}{}", stdout.trim(), err.trim());
+            let tip = advice(&detail);
+            let suffix = if tip.is_empty() { String::new() } else { format!("\n  -> {tip}") };
+            bail!("adb {} failed: {}{}{suffix}", argv.join(" "), stdout.trim(), err.trim());
         }
         Ok(stdout)
     }
@@ -115,6 +135,15 @@ mod tests {
         assert_eq!(d[0].state, "device");
         assert_eq!(d[0].model.as_deref(), Some("Chromecast"));
         assert_eq!(d[1].state, "offline");
+    }
+
+    #[test]
+    fn adb_errors_carry_a_next_step() {
+        assert!(advice("adb: device unauthorized.\nThis adb server's $ADB_VENDOR_KEYS is not set").contains("accept the"));
+        assert!(advice("error: no devices/emulators found").contains("connect"));
+        assert!(advice("error: more than one device/emulator").contains("-s"));
+        assert!(advice("error: device offline").contains("offline"));
+        assert!(advice("error: closed").is_empty());
     }
 
     #[test]

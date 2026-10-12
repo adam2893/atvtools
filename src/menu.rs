@@ -117,7 +117,11 @@ fn ask(prompt: &str) -> Result<String> {
     print!("{prompt} > ");
     io::stdout().flush()?;
     let mut s = String::new();
-    io::stdin().read_line(&mut s)?;
+    // stdin closed (piped input ran out, or ^D): leave instead of looping on "".
+    if io::stdin().read_line(&mut s)? == 0 {
+        println!();
+        std::process::exit(0);
+    }
     Ok(s.trim().to_string())
 }
 
@@ -147,6 +151,10 @@ impl Target {
         self.asked = true;
     }
 
+    fn resolved(&mut self) {
+        self.asked = true;      // the menu tried; do not interrupt an action
+    }
+
     fn label(&self, lang: Lang) -> String {
         self.serial.clone().unwrap_or_else(|| lang.t("default").to_string())
     }
@@ -155,6 +163,17 @@ impl Target {
 pub fn run(lang: &str) -> Result<()> {
     let mut lang = Lang::parse(lang);
     let mut target = Target::default();
+    // The original opened on the IP screen; do the same when no TV is attached yet.
+    let usable = Adb::new(None)
+        .devices()
+        .map(|d| d.iter().any(|x| x.state == "device"))
+        .unwrap_or(false);
+    if !usable && target.serial.is_none() {
+        if let Err(e) = connect_screen(lang, &mut target) {
+            println!("{DIM}{e}{RESET}");
+        }
+        target.resolved();
+    }
     loop {
         let where_ = target.label(lang);
         println!("\n{TITLE}  Android TV Tools{RESET} {DIM}({}){RESET} {DIM}{} {where_}{RESET}", lang.t("subtitle"), lang.t("target"));
@@ -285,8 +304,8 @@ fn action(lang: Lang, target: &mut Target, choice: &str) -> Result<()> {
                 }
             }
             "2" => {
-                let adb = target.adb(lang)?;
                 println!("1 list   2 install apk   3 backup all   4 debloat preset");
+                let adb = target.adb(lang)?;
                 match ask("")?.as_str() {
                     "1" => {
                         for p in apps::list(&adb, apps::Scope::ThirdParty)? {
@@ -298,10 +317,11 @@ fn action(lang: Lang, target: &mut Target, choice: &str) -> Result<()> {
                         apps::backup_all(&adb, std::path::Path::new(&ask("directory")?))?;
                     }
                     _ => {
-                        println!("{}", debloat::titles());
+                        println!("{}", debloat::numbered());
+                        println!("{DIM}{}{RESET}", debloat::titles());
                         let name = ask("preset")?;
-                        let preset = debloat::find(&name)
-                            .ok_or_else(|| anyhow::anyhow!("unknown preset '{name}'"))?;
+                        let preset = debloat::find_any(&name)
+                            .ok_or_else(|| anyhow::anyhow!("pick a number (1-{}) or a name, not '{name}'", debloat::PRESETS.len()))?;
                         apps::set_enabled(&adb, &preset.packages.iter().map(|p| p.to_string()).collect::<Vec<_>>(), false)?;
                     }
                 }

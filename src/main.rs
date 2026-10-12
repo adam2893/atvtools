@@ -575,7 +575,7 @@ fn main() -> Result<()> {
                 }
             }
             PresetOp::Apply { name, yes } => {
-                let p = debloat::find(&name)
+                let p = debloat::find_any(&name)
                     .ok_or_else(|| anyhow::anyhow!("unknown preset '{name}'. known: {}", debloat::titles()))?;
                 if !yes && !confirm(&format!("disable {} packages from '{}'?", p.packages.len(), p.title))? {
                     println!("aborted");
@@ -585,7 +585,7 @@ fn main() -> Result<()> {
                 apps::set_enabled(&adb, &pkgs, false)?;
             }
             PresetOp::Undo { name } => {
-                let p = debloat::find(&name)
+                let p = debloat::find_any(&name)
                     .ok_or_else(|| anyhow::anyhow!("unknown preset '{name}'. known: {}", debloat::titles()))?;
                 let pkgs: Vec<String> = p.packages.iter().map(|s| (*s).to_string()).collect();
                 apps::set_enabled(&adb, &pkgs, true)?;

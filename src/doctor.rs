@@ -61,6 +61,10 @@ pub fn run(adb: &Adb) -> Result<()> {
     if devices.is_empty() {
         println!("                 -> enable developer options on the TV, then: atvtools connect <tv-ip>");
     }
+    for d in devices.iter().filter(|d| d.state != "device") {
+        let why = crate::adb::advice(&d.state);
+        println!("                 -> {} is {}{}", d.serial, d.state, if why.is_empty() { String::new() } else { format!(": {why}") });
+    }
 
     let online = crate::download::fetch_text("https://ipinfo.io/country").ok();
     println!("internet       : {}", if online.is_some() { "yes" } else { "no (/ catalogue installs will fail)" });
