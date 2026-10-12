@@ -22,7 +22,8 @@ the mirroring binary.
 
 ```sh
 atvtools devices
-atvtools connect 192.168.1.50
+atvtools connect                 # scan this network and list the TVs that answered
+atvtools connect 192.168.1.50    # or connect straight to a known address
 atvtools -s 192.168.1.50:5555 apps list --scope third-party
 atvtools -s 192.168.1.50:5555 apps install ./app.apk
 atvtools -s 192.168.1.50:5555 apps disable com.example.bloat
@@ -54,6 +55,7 @@ atvtools apk info ./app.apk      # label, version, launch activity (aapt2 on PAT
 
 | Original (v4.0) | atvtools |
 |---|---|
+| IP connection screen (ARP scan, FIND/LOG/HELP) | `C` in the menu; `atvtools connect` scans and lists what answered, `connect <host>` connects, `mdns`, `history` |
 | A Remote Control (cmdmax.exe + RC_Emulator.bat) | `remote` (interactive keypad), `remote uudok` (scripted), `screen scrcpy`; `doctor` covers the console diagnostics |
 | B Remove ads (AdGuard DNS / AdGuard TV) | `settings adblock-on`, `install adguard-tv` |
 | 1 Transfer files / clipboard | `transfer push\|pull\|ls\|mkdir`, `device text` — no FTP app on the TV needed |
@@ -89,6 +91,10 @@ atvtools apk info ./app.apk      # label, version, launch activity (aapt2 on PAT
 
 ## Port notes
 
+- Finding the TV: `adb mdns services` first, then the host neighbour table
+  (`arp -an` / `ip neigh` / `arp -a`). Each candidate is TCP-checked on its adb
+  port (400 ms) before `adb connect`, because adb's own connect can block for
+  minutes on a host that answers nothing; at most 64 hosts are probed per scan.
 - `adb` is invoked without a shell, arguments verbatim: the original's quoting
   bugs (`set cmdline=`, `FOR /F` parsing of `pm path`, `del "..."` gymnastics)
   cannot happen here.

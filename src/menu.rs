@@ -7,6 +7,7 @@ use crate::apps;
 use crate::catalog;
 use crate::debloat;
 use crate::device;
+use crate::net;
 use crate::remote;
 use crate::settings;
 use anyhow::Result;
@@ -69,6 +70,13 @@ const EN: &[(&str, &str)] = &[
     ("quit", "quit"),
     ("unknown", "unknown option"),
     ("serial", "serial (empty = adb default)"),
+    ("connect", "Connect to the TV"),
+    ("find", "find it on the network"),
+    ("typeip", "type its IP (Settings > System > Status)"),
+    ("last", "last used:"),
+    ("back", "back"),
+    ("nofind", "no TV answered - turn it on, enable developer options > network debugging, same Wi-Fi"),
+    ("ipprompt", "IP address of the TV"),
     ("target", "target"),
     ("default", "adb default"),
     ("nodev", "no device attached - connect the TV, or press T to set its address"),
@@ -92,6 +100,13 @@ const ES: &[(&str, &str)] = &[
     ("quit", "salir"),
     ("unknown", "opción desconocida"),
     ("serial", "serie (vacío = la de adb por defecto)"),
+    ("connect", "Conectar con la TV"),
+    ("find", "buscarla en la red"),
+    ("typeip", "escribir su IP (Ajustes > Sistema > Estado)"),
+    ("last", "ultima usada:"),
+    ("back", "volver"),
+    ("nofind", "ninguna TV respondio - enciendela, activa opciones de desarrollador > depuracion de red, misma Wi-Fi"),
+    ("ipprompt", "direccion IP de la TV"),
     ("target", "destino"),
     ("default", "adb por defecto"),
     ("nodev", "no hay ningun dispositivo - conecta la TV, o pulsa T para dar su direccion"),
@@ -144,6 +159,7 @@ pub fn run(lang: &str) -> Result<()> {
         let where_ = target.label(lang);
         println!("\n{TITLE}  Android TV Tools{RESET} {DIM}({}){RESET} {DIM}{} {where_}{RESET}", lang.t("subtitle"), lang.t("target"));
         for (k, key) in [
+            ("C", "connect"),
             ("A", "remote"),
             ("B", "adblock"),
             ("1", "files"),
@@ -173,6 +189,12 @@ pub fn run(lang: &str) -> Result<()> {
             println!("{OK}lang = {}{RESET}", lang.code());
             continue;
         }
+        if choice == "c" {
+            if let Err(e) = connect_screen(lang, &mut target) {
+                println!("{DIM}error: {e}{RESET}");
+            }
+            continue;
+        }
         if choice == "t" {
             target.set(ask(lang.t("serial"))?);
             println!("{OK}{} {}{RESET}", lang.t("target"), target.label(lang));
@@ -182,6 +204,49 @@ pub fn run(lang: &str) -> Result<()> {
             Ok(()) => println!("{OK}{}{RESET}", lang.t("done")),
             Err(e) => println!("{DIM}error: {e}{RESET}"),
         }
+    }
+}
+
+/// The original's IP connection screen: find the TV, type its address, or reuse the last one.
+fn connect_screen(lang: Lang, target: &mut Target) -> Result<()> {
+    let adb = Adb::new(None);          // the connect itself does not need a serial yet
+    loop {
+        let last = crate::history().pop();
+        println!("\n{TITLE}{}{RESET}", lang.t("connect"));
+        println!("  {KEY}1{RESET}  {}", lang.t("find"));
+        println!("  {KEY}2{RESET}  {}", lang.t("typeip"));
+        println!("  {KEY}3{RESET}  {} {}", lang.t("last"), last.clone().unwrap_or_else(|| "-".to_string()));
+        println!("  {KEY}0{RESET}  {}", lang.t("back"));
+        let choice = ask("")?.trim().to_ascii_lowercase();
+        let host = match choice.as_str() {
+            "1" => {
+                let hits = net::probe(&adb, &net::candidates(&adb));
+                match hits.first() {
+                    Some(h) => h.clone(),
+                    None => {
+                        println!("{DIM}{}{RESET}", lang.t("nofind"));
+                        continue;
+                    }
+                }
+            }
+            "2" => ask(lang.t("ipprompt"))?,
+            "3" => match last {
+                Some(h) => h,
+                None => {
+                    println!("{DIM}-{RESET}");
+                    continue;
+                }
+            },
+            _ => return Ok(()),
+        };
+        match crate::connect_to(&adb, &host) {
+            Ok(msg) => {
+                target.set(host);
+                println!("{OK}{msg}{RESET}");
+            }
+            Err(e) => println!("{DIM}{e}{RESET}"),
+        }
+        return Ok(());
     }
 }
 

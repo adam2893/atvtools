@@ -15,6 +15,7 @@ mod download;
 mod google;
 mod iptv;
 mod menu;
+mod net;
 mod remote;
 mod screen;
 mod settings;
@@ -43,8 +44,8 @@ struct Cli {
 enum Cmd {
     /// List attached devices.
     Devices,
-    /// Connect to a TV over the network (port 5555 assumed).
-    Connect { host: String },
+    /// Connect to a TV over the network; with no address, scan for one (port 5555 assumed).
+    Connect { host: Option<String> },
     /// Disconnect network devices.
     Disconnect,
     /// Run a raw adb shell command.
@@ -400,6 +401,22 @@ enum PresetOp {
     Undo { name: String },
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adb_error_text_is_not_mistaken_for_a_device_name() {
+        assert!(plain_answer("Chromecast HD"));
+        assert!(plain_answer("NVIDIA SHIELD Android TV"));
+        assert!(!plain_answer(""));
+        assert!(!plain_answer("adb -s 192.168.1.5:5555 shell getprop ro.product.model failed: adb: device unauthorized"));
+        assert!(!plain_answer("error: device offline"));
+        assert!(!plain_answer("unauthorized"));
+        assert!(!plain_answer(&"x".repeat(80)));
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let adb = Adb::new(cli.serial.clone());
@@ -411,13 +428,24 @@ fn main() -> Result<()> {
                 println!("{}\t{}\t{}", d.serial, d.state, d.model.unwrap_or_default());
             }
         }
-        Cmd::Connect { host } => {
-            let out = adb.connect(&host)?.trim().to_string();
-            println!("{out}");
-            if out.to_ascii_lowercase().contains("connected") {
-                remember(&host);
+        Cmd::Connect { host } => match host {
+            Some(host) => {
+                println!("{}", connect_to(&adb, &host)?);
             }
-        }
+            None => {
+                let found = net::probe(&adb, &net::candidates(&adb));
+                if found.is_empty() {
+                    println!("no TV answered on this network");
+                    println!("  - enable Developer options > USB/network debugging on the TV");
+                    println!("  - keep the TV on the same Wi-Fi, then: atvtools connect <tv-ip>");
+                } else {
+                    for host in &found {
+                        println!("{host}");
+                    }
+                    println!("connect with: atvtools connect <host>");
+                }
+            }
+        },
         Cmd::Disconnect => println!("{}", adb.disconnect()?.trim()),
         Cmd::Shell { command } => {
             if command.is_empty() {
@@ -659,15 +687,54 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Connects, remembers the address and reports what answered.
+pub fn connect_to(adb: &Adb, host: &str) -> Result<String> {
+    let target = net::normalize_target(host, net::ADB_PORT);
+    let out = adb.connect(&target)?.trim().to_string();
+    if !out.to_ascii_lowercase().contains("connected to") {
+        anyhow::bail!("{out}");
+    }
+    remember(&target);
+    let named = Adb::new(Some(target.clone()));
+    let model = prop_value(&named, "ro.product.model");
+    let maker = prop_value(&named, "ro.product.manufacturer");
+    if model.is_none() && maker.is_none() {
+        // adb answered but the TV has not trusted this computer yet.
+        let state = named.try_out(&["get-state"]).trim().to_string();
+        return Ok(if state.contains("unauthorized") {
+            format!("{out}\n  -> the TV is showing an authorization dialog: allow it, then press C again")
+        } else {
+            out
+        });
+    }
+    let who = [maker, model].into_iter().flatten().collect::<Vec<_>>().join(" ");
+    Ok(format!("{out} ({who})"))
+}
+
+/// A getprop answer, or None when adb failed and printed its own error at us.
+fn prop_value(adb: &Adb, name: &str) -> Option<String> {
+    let v = adb.try_out(&["shell", &format!("getprop {name}")]).trim().to_string();
+    if plain_answer(&v) { Some(v) } else { None }
+}
+
+fn plain_answer(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 40
+        && !v.contains('\n')
+        && !v.to_ascii_lowercase().contains("failed")
+        && !v.to_ascii_lowercase().contains("error")
+        && !v.to_ascii_lowercase().contains("unauthorized")
+}
+
 /// ~/.atvtools/history.txt - the original kept a history of TV devices.
-fn history_file() -> Option<PathBuf> {
+pub fn history_file() -> Option<PathBuf> {
     let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
     let dir = PathBuf::from(home).join(".atvtools");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("history.txt"))
 }
 
-fn history() -> Vec<String> {
+pub fn history() -> Vec<String> {
     let mut v = history_file()
         .and_then(|f| std::fs::read_to_string(f).ok())
         .map(|s| s.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect())
@@ -676,7 +743,7 @@ fn history() -> Vec<String> {
     v
 }
 
-fn remember(host: &str) {
+pub fn remember(host: &str) {
     let Some(f) = history_file() else { return };
     let mut seen = history();
     if !seen.iter().any(|h| h == host) {
