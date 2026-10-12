@@ -45,21 +45,30 @@ pub fn install_with(adb: &Adb, apks: &[PathBuf], replace: bool) -> Result<()> {
     }
     for apk in apks {
         let path = apk.to_string_lossy().to_string();
-        let out = adb.out(&["install", "-r", "-g", &path])?;
+        let install = |p: &str| adb.output(&["install", "-r", "-g", p]);
+        let (ok, stdout, stderr) = install(&path)?;
+        let out = format!("{}{}", stdout.trim(), stderr.trim());
         if let Some(pkg) = mismatch_package(&out) {
             if !replace {
                 bail!(
-                    "{pkg} is already installed from a different build ({}).
-  -> re-run with --replace to remove that copy first, or run: atvtools apps uninstall {pkg}",
-                    out.trim()
+                    "{pkg} is already installed from a different build.
+  -> re-run with --replace to remove that copy first, or run: atvtools apps uninstall {pkg}
+  adb said: {out}"
                 );
             }
             remove_any_version(adb, &pkg)?;
-            let again = adb.out(&["install", "-r", "-g", &path])?;
-            println!("{}: {} (replaced the previously installed {pkg})", apk.display(), again.trim());
+            let (ok2, stdout2, stderr2) = install(&path)?;
+            let again = format!("{}{}", stdout2.trim(), stderr2.trim());
+            if !ok2 {
+                bail!("reinstalling {} after removing {pkg} also failed: {again}", apk.display());
+            }
+            println!("{}: {} (replaced the previously installed {pkg})", apk.display(), again);
             continue;
         }
-        println!("{}: {}", apk.display(), out.trim());
+        if !ok {
+            bail!("adb install -r -g {} failed: {out}", apk.display());
+        }
+        println!("{}: {}", apk.display(), out);
     }
     Ok(())
 }
@@ -415,5 +424,58 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert!(p[0].ends_with("base.apk"));
         assert!(p[1].ends_with("split_config.arm64.apk"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod install_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A fake adb: rejects the install once with the real signature-mismatch text, and succeeds
+    /// after anything ran an uninstall.
+    fn fake_adb(dir: &std::path::Path) -> Adb {
+        let marker = dir.join("uninstalled");
+        let script = dir.join("adb");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *uninstall*) touch {}\n    echo Success\n    exit 0 ;;\n  *install*)\n    if [ -f {} ]; then echo 'Success'; exit 0; fi\n    echo 'adb: failed to install x: Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package moe.shizuku.privileged.api signatures do not match newer version; ignoring!]' 1>&2\n    exit 1 ;;\nesac\necho ''\n",
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut adb = Adb::new(None);
+        adb.serial = None;
+        adb.bin = script.to_string_lossy().to_string();
+        adb
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("atvtools-install-test-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_signature_mismatch_asks_for_replace_instead_of_dumping_adb_text() {
+        let d = tmp("mismatch");
+        let apk = d.join("shizuku-fork.apk");
+        std::fs::write(&apk, b"apk").unwrap();
+        let err = install_with(&fake_adb(&d), &[apk], false).unwrap_err().to_string();
+        assert!(err.contains("--replace"), "{err}");
+        assert!(err.contains("moe.shizuku.privileged.api"), "{err}");
+        assert!(!d.join("uninstalled").exists(), "nothing may be removed without --replace");
+    }
+
+    #[test]
+    fn replace_removes_the_other_build_and_installs() {
+        let d = tmp("replace");
+        let apk = d.join("shizuku-fork.apk");
+        std::fs::write(&apk, b"apk").unwrap();
+        install_with(&fake_adb(&d), &[apk], true).unwrap();
+        assert!(d.join("uninstalled").exists(), "the old build should have been removed");
     }
 }

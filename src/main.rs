@@ -366,7 +366,11 @@ enum AppsOp {
 #[derive(Subcommand, Debug)]
 enum ShizukuOp {
     /// Download and install fork-Shizuku.
-    Install,
+    Install {
+        /// Remove an official Shizuku of the same id first (their signatures differ).
+        #[arg(long)]
+        replace: bool,
+    },
     /// Start the Shizuku server over adb (open the app on the TV once first).
     Start,
     /// Stop the Shizuku server.
@@ -624,12 +628,12 @@ fn main() -> Result<()> {
         }
         Cmd::Install { name, replace } => download::install_catalog_with(&adb, &name, replace)?,
         Cmd::Shizuku { op } => match op {
-            ShizukuOp::Install => {
+            ShizukuOp::Install { replace } => {
                 let e = catalog::find("shizuku-fork")
                     .ok_or_else(|| anyhow::anyhow!("shizuku-fork is missing from the catalog"))?;
                 let dest = std::env::temp_dir().join("atvtools").join(format!("{}.apk", e.name));
                 download::fetch(e.url, &dest)?;
-                apps::install(&adb, &[dest])?;
+                apps::install_with(&adb, &[dest], replace)?;
             }
             ShizukuOp::Start => shizuku::start(&adb)?,
             ShizukuOp::Stop => shizuku::stop(&adb)?,

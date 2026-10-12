@@ -54,20 +54,30 @@ impl Adb {
         v
     }
 
-    pub fn out(&self, args: &[&str]) -> Result<String> {
+    /// Raw run: (success, stdout, stderr). Never fails on a non-zero exit, so callers can read
+    /// the failure text adb printed instead of losing it to an early error.
+    pub fn output(&self, args: &[&str]) -> Result<(bool, String, String)> {
         let argv = self.args_for(args);
         let o = Command::new(&self.bin)
             .args(&argv)
             .stdin(Stdio::null())
             .output()
             .with_context(|| format!("running {} {}", self.bin, argv.join(" ")))?;
-        let stdout = String::from_utf8_lossy(&o.stdout).to_string();
-        if !o.status.success() {
-            let err = String::from_utf8_lossy(&o.stderr);
-            let detail = format!("{}{}", stdout.trim(), err.trim());
+        Ok((
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        ))
+    }
+
+    pub fn out(&self, args: &[&str]) -> Result<String> {
+        let argv = self.args_for(args);
+        let (ok, stdout, stderr) = self.output(args)?;
+        if !ok {
+            let detail = format!("{}{}", stdout.trim(), stderr.trim());
             let tip = advice(&detail);
             let suffix = if tip.is_empty() { String::new() } else { format!("\n  -> {tip}") };
-            bail!("adb {} failed: {}{}{suffix}", argv.join(" "), stdout.trim(), err.trim());
+            bail!("adb {} failed: {}{}{suffix}", argv.join(" "), stdout.trim(), stderr.trim());
         }
         Ok(stdout)
     }
