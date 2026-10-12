@@ -58,6 +58,7 @@ struct App {
     dpi: String,
     scale: String,
     seconds: String,
+    replace: bool,
 }
 
 impl App {
@@ -81,6 +82,7 @@ impl App {
             dpi: String::new(),
             scale: String::new(),
             seconds: "20".to_string(),
+            replace: false,
         };
         app.say("atvtools GUI. Connect to a TV on the first tab, then pick a tab above.");
         app
@@ -566,20 +568,25 @@ impl App {
         });
         ui.separator();
         ui.label("Catalog: download and install on the TV");
+        ui.checkbox(
+            &mut self.replace,
+            "replace an existing copy of the same id (removes the other build first)",
+        );
         for e in catalog::CATALOG {
             ui.horizontal(|ui| {
                 if ui.small_button("install").clicked() {
                     let url = e.url.to_string();
                     let name = e.name.to_string();
                     let label = name.clone();
+                    let replace = self.replace;
                     self.act(&label, move |adb| {
                         let abis = catalog::abis(adb);
                         let abis: Vec<&str> = abis.iter().map(String::as_str).collect();
                         let url = catalog::resolve(&url, &abis)?;
                         let dest = std::env::temp_dir().join("atvtools").join(format!("{name}.apk"));
                         download::fetch(&url, &dest)?;
-                        apps::install(adb, &[dest])?;
-                        Ok(format!("installed {name}"))
+                        apps::install_with(adb, &[dest], replace)?;
+                        Ok(format!("installed {name}{}", if replace { " (replacing)" } else { "" }))
                     });
                 }
                 ui.monospace(e.name);

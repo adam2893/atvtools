@@ -74,7 +74,7 @@ an [egui](https://github.com/emilk/egui) window with the same reach as the CLI:
 | Settings | density, font scale, AdGuard DNS, OTA blocking, the on/off toggles, settings-screen shortcuts |
 | Screen | screenshot, timed screen recording, scrcpy |
 | Remote | every keycode as a button, plus text, URL, wake/sleep/reboot and the notification shade |
-| Helpers | doctor, device info, optimize, update check, catalog installs |
+| Helpers | doctor, device info, optimize, update check, catalog installs (a tick box removes an existing copy of the same id first, e.g. official Shizuku → fork) |
 
 Everything the GUI runs it runs through the same modules as the CLI, so a button
 and its subcommand behave identically. The activity pane at the bottom keeps the
