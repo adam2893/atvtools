@@ -128,6 +128,42 @@ pub fn screensaver(adb: &Adb, component: &str) -> Result<()> {
     Ok(())
 }
 
+/// Android TV OTA updates are a global flag and survive reboot.
+pub fn ota(adb: &Adb, off: bool) -> Result<()> {
+    let v = if off { "1" } else { "0" };
+    adb.shell(&format!("settings put global ota_disable_automatic_update {v}"))?;
+    println!("ota updates: {}", if off { "blocked" } else { "allowed" });
+    Ok(())
+}
+
+pub fn ota_state(adb: &Adb) -> Result<String> {
+    let v = adb.shell("settings get global ota_disable_automatic_update")?;
+    Ok(match v.trim() {
+        "1" => "blocked".to_string(),
+        "0" => "allowed".to_string(),
+        other => format!("unset ({other})"),
+    })
+}
+
+pub fn ms(seconds: u32) -> u32 {
+    seconds.saturating_mul(1000)
+}
+
+/// Idle/ambient timeouts. Keys differ per OEM build, so both are written and
+/// what actually stuck is read back.
+pub fn set_idle_timeout(adb: &Adb, seconds: u32) -> Result<String> {
+    let ms = ms(seconds);
+    adb.shell(&format!("settings put system screen_off_timeout {ms}")).ok();
+    adb.shell(&format!("settings put secure doze_timeout {ms}")).ok();
+    idle_timeout(adb)
+}
+
+pub fn idle_timeout(adb: &Adb) -> Result<String> {
+    let screen = adb.shell("settings get system screen_off_timeout")?;
+    let doze = adb.shell("settings get secure doze_timeout")?;
+    Ok(format!("screen_off_timeout={} doze_timeout={}", screen.trim(), doze.trim()))
+}
+
 /// Apply one appop to every third-party package - the script's "grant write
 /// permissions on external USB" step, generalised to any op.
 pub fn set_default_permissions(adb: &Adb, op: &str, allow: bool) -> Result<()> {
@@ -168,6 +204,12 @@ mod tests {
     fn toggles_resolve_by_name() {
         assert_eq!(TOGGLES.iter().find(|t| t.name == "gps").unwrap().key, "location_mode");
         assert!(toggle_names().contains("play-protect"));
+    }
+
+    #[test]
+    fn timeouts_are_converted_to_ms() {
+        assert_eq!(ms(60), 60000);
+        assert_eq!(ms(0), 0);
     }
 
     #[test]

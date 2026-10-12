@@ -5,15 +5,22 @@
 //! onto these subcommands.
 
 mod adb;
+mod apk;
 mod apps;
 mod catalog;
 mod debloat;
 mod device;
+mod doctor;
 mod download;
+mod google;
+mod iptv;
 mod menu;
+mod remote;
 mod screen;
 mod settings;
 mod shizuku;
+mod transfer;
+mod update;
 
 use adb::Adb;
 use anyhow::Result;
@@ -109,8 +116,90 @@ enum Cmd {
     History,
     /// Animation scales, cache trim, background app kill.
     Optimize,
+    /// Push and pull files between this machine and the TV.
+    Transfer {
+        #[command(subcommand)]
+        op: TransferOp,
+    },
+    /// Interactive remote control.
+    Remote {
+        /// Scripted key sequence instead of the prompt, e.g. uudr.
+        keys: Option<String>,
+    },
+    /// IPTV playlists (m3u) on the device.
+    Iptv {
+        #[command(subcommand)]
+        op: IptvOp,
+    },
+    /// Preflight: adb, device, internet, region, OTA.
+    Doctor,
+    /// Check for a newer build.
+    Update {
+        /// Read the old tool's "version;url;changelog" beacon instead.
+        #[arg(long)]
+        beacon: Option<String>,
+    },
+    /// APK metadata for local files (uses the host's aapt2).
+    Apk {
+        #[command(subcommand)]
+        op: ApkOp,
+    },
+    /// Bare-device bootstrap: install the Google stack from a folder of APKs.
+    Google {
+        #[arg(short, long, default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Assistant key, optionally followed by the text to dictate.
+    Voice { words: Vec<String> },
     /// Interactive menu.
-    Menu,
+    Menu {
+        /// Menu language: en or es.
+        #[arg(long, default_value = "en")]
+        lang: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TransferOp {
+    /// Send a local file to the TV.
+    Push {
+        local: PathBuf,
+        #[arg(default_value = transfer::DOWNLOADS)]
+        remote: String,
+    },
+    /// Fetch a file from the TV.
+    Pull { remote: String, local: PathBuf },
+    /// List a device directory.
+    Ls {
+        #[arg(default_value = transfer::DOWNLOADS)]
+        remote: String,
+    },
+    /// Create a device directory.
+    Mkdir { remote: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum IptvOp {
+    /// Download an m3u playlist and copy it into the TV's Downloads folder.
+    Add {
+        url: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List playlists already on the device.
+    List,
+    /// Hand a playlist URL to the player app on the TV.
+    Open { url: String },
+    /// Open a player's install listing (no argument lists them).
+    Install { player: Option<String> },
+}
+
+#[derive(Subcommand, Debug)]
+enum ApkOp {
+    /// Package, version, label and launch activity of one APK.
+    Info { file: PathBuf },
+    /// Every .apk in a folder, in install order.
+    List { dir: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -269,6 +358,17 @@ enum SettingsOp {
     Dns,
     /// Set the NTP server.
     Ntp { host: String },
+    /// Android TV OTA updates (no flag prints the state).
+    Ota {
+        /// Block them.
+        #[arg(long, conflicts_with = "on")]
+        off: bool,
+        /// Allow them again.
+        #[arg(long)]
+        on: bool,
+    },
+    /// Idle/ambient timeout in seconds (no argument prints it).
+    IdleTimeout { seconds: Option<u32> },
 }
 
 #[derive(Subcommand, Debug)]
@@ -403,6 +503,17 @@ fn main() -> Result<()> {
             SettingsOp::AdblockOff => settings::adblock_off(&adb)?,
             SettingsOp::Dns => println!("{}", settings::dns_state(&adb)?),
             SettingsOp::Ntp { host } => settings::set_ntp(&adb, &host)?,
+            SettingsOp::Ota { off, on } => {
+                if !off && !on {
+                    println!("ota updates: {}", settings::ota_state(&adb)?);
+                } else {
+                    settings::ota(&adb, off)?;
+                }
+            }
+            SettingsOp::IdleTimeout { seconds } => match seconds {
+                Some(s) => println!("{}", settings::set_idle_timeout(&adb, s)?),
+                None => println!("{}", settings::idle_timeout(&adb)?),
+            },
         },
         Cmd::Screen { op } => match op {
             ScreenOp::Shot { file } => screen::screenshot(&adb, &file)?,
@@ -414,13 +525,7 @@ fn main() -> Result<()> {
                 println!("{:<24} {}", e.name, e.note);
             }
         }
-        Cmd::Install { name } => {
-            let e = catalog::find(&name)
-                .ok_or_else(|| anyhow::anyhow!("unknown app '{name}'. known: {}", catalog::names()))?;
-            let dest = std::env::temp_dir().join("atvtools").join(format!("{}.apk", e.name));
-            download::fetch(e.url, &dest)?;
-            apps::install(&adb, &[dest])?;
-        }
+        Cmd::Install { name } => download::install_catalog(&adb, &name)?,
         Cmd::Shizuku { op } => match op {
             ShizukuOp::Install => {
                 let e = catalog::find("shizuku-fork")
@@ -500,7 +605,54 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Optimize => device::optimize(&adb)?,
-        Cmd::Menu => menu::run()?,
+        Cmd::Transfer { op } => match op {
+            TransferOp::Push { local, remote } => transfer::push(&adb, &local, &remote)?,
+            TransferOp::Pull { remote, local } => transfer::pull(&adb, &remote, &local)?,
+            TransferOp::Ls { remote } => println!("{}", transfer::ls(&adb, &remote)?),
+            TransferOp::Mkdir { remote } => transfer::mkdir(&adb, &remote)?,
+        },
+        Cmd::Remote { keys } => match keys {
+            Some(seq) => device::key(&adb, &remote::expand(&seq))?,
+            None => remote::run(&adb)?,
+        },
+        Cmd::Iptv { op } => match op {
+            IptvOp::Add { url, name } => println!("{}", iptv::add(&adb, &url, name.as_deref())?),
+            IptvOp::List => println!("{}", iptv::list(&adb)?),
+            IptvOp::Open { url } => iptv::open(&adb, &url)?,
+            IptvOp::Install { player } => match player {
+                Some(p) => {
+                    let pkg = iptv::player(&p)
+                        .ok_or_else(|| anyhow::anyhow!("unknown player '{p}'. known: {}", iptv::players()))?;
+                    apps::open_store(&adb, pkg)?;
+                }
+                None => println!("{}", iptv::players()),
+            },
+        },
+        Cmd::Doctor => doctor::run(&adb)?,
+        Cmd::Update { beacon } => update::check(env!("CARGO_PKG_VERSION"), beacon.as_deref())?,
+        Cmd::Apk { op } => match op {
+            ApkOp::Info { file } => {
+                let b = apk::info(&file)?;
+                println!("package      : {}", b.package);
+                println!("label        : {}", b.label);
+                println!("version      : {} ({})", b.version_name, b.version_code);
+                println!("sdk / target : {} / {}", b.sdk, b.target_sdk);
+                if let Some(a) = b.launchable {
+                    println!("launchable   : {a}");
+                }
+            }
+            ApkOp::List { dir } => {
+                for f in apk::apks(&dir)? {
+                    match apk::info(&f) {
+                        Ok(b) => println!("{:<40} {:<28} {}", b.package, b.label, b.version_name),
+                        Err(e) => println!("{:<40} ({e})", f.display()),
+                    }
+                }
+            }
+        },
+        Cmd::Google { dir } => google::install(&adb, &dir)?,
+        Cmd::Voice { words } => device::assist(&adb, &words)?,
+        Cmd::Menu { lang } => menu::run(&lang)?,
     }
     Ok(())
 }

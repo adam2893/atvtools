@@ -11,7 +11,7 @@ talks to `adb` directly on macOS, Linux and Windows.
 
 ```sh
 cargo build --release      # target/release/atvtools
-cargo test                 # unit tests (7)
+cargo test                 # unit tests (31)
 ```
 
 Requirements: `adb` on PATH, or `ADB=/path/to/adb`. `curl` is used for
@@ -32,35 +32,59 @@ atvtools -s 192.168.1.50:5555 settings adblock-on
 atvtools -s 192.168.1.50:5555 screen shot shot.png
 atvtools -s 192.168.1.50:5555 install smarttube
 atvtools -s 192.168.1.50:5555 preset apply google-tv-ads --yes
-atvtools menu
+atvtools menu                    # or: atvtools menu --lang es
+
+# added over the Windows tool
+atvtools -s 192.168.1.50:5555 remote                 # keypad in this terminal
+atvtools -s 192.168.1.50:5555 remote uudok           # scripted key sequence
+atvtools -s 192.168.1.50:5555 transfer push ./a.mkv /sdcard/Download
+atvtools -s 192.168.1.50:5555 transfer pull /sdcard/Download/list.m3u ./list.m3u
+atvtools -s 192.168.1.50:5555 iptv add https://example.tld/spain.m3u
+atvtools -s 192.168.1.50:5555 iptv open https://example.tld/spain.m3u
+atvtools -s 192.168.1.50:5555 google --dir ~/Downloads/google-tv-apks
+atvtools -s 192.168.1.50:5555 settings idle-timeout 900
+atvtools -s 192.168.1.50:5555 settings ota --off
+atvtools doctor                  # adb version, devices, internet, egress country, OTA
+atvtools update                  # newer release?; update --beacon <url> reads the old Dropbox beacon
+atvtools apk info ./app.apk      # label, version, launch activity (aapt2 on PATH, or AAPT=...)
 ```
 
 ## Original menu → this CLI
 
 | Original (v4.0) | atvtools |
 |---|---|
-| A Remote Control (cmdmax.exe) | `screen scrcpy` + `shell` — cmdmax itself is a Windows-only helper, not ported |
+| A Remote Control (cmdmax.exe + RC_Emulator.bat) | `remote` (interactive keypad), `remote uudok` (scripted), `screen scrcpy`; `doctor` covers the console diagnostics |
 | B Remove ads (AdGuard DNS / AdGuard TV) | `settings adblock-on`, `install adguard-tv` |
-| 1 Transfer files / clipboard | `shell`, plus `adb push` / `adb pull` |
+| 1 Transfer files / clipboard | `transfer push\|pull\|ls\|mkdir`, `device text` — no FTP app on the TV needed |
 | 2 Install / uninstall / enable / disable / debloat | `apps install\|uninstall\|disable\|enable\|backup`, `preset apply` |
 | 3 Backup and restore | `apps backup`; restoring is `apps install` on the pulled APKs |
-| 4 Custom settings (ad protection, NTP, storage grants) | `settings adblock-*`, `settings ntp`, `apps appop --all storage` |
+| 4 Custom settings (ad protection, NTP, storage grants, OTA, idle timeout) | `settings adblock-*`, `settings ntp`, `apps appop --all storage`, `settings ota`, `settings idle-timeout` |
 | 5 Density / font scale | `settings set-density`, `settings set-font-scale` |
 | 6 Screenshot / screenrecord | `screen shot`, `screen record` |
-| 7 Installer helper (SmartTube, launchers, stores) | `catalog`, `install <name>` |
-| 8 Optimizations (Perf_Optim.bat) | not ported — see below |
+| 7 Installer helper (SmartTube, launchers, stores, IPTV) | `catalog`, `install <name>`, `iptv install\|add\|open` |
+| 8 Optimizations (Perf_Optim.bat) | `optimize` |
 
-## Deliberately not ported
+## Not ported as a bundled binary, and why
 
-- **cmdmax.exe remote control** — a Windows-only companion the original
-  downloads from `github.com/tenox7/cmdmax`; `scrcpy` covers the same ground
-  and is already cross-platform.
-- **Self-update from Dropbox** — the original pulls a zip and overwrites its own
-  directory. Updates belong to a package manager, not to the tool.
-- **aapt / uad_gui / PMX** — separate upstream projects the original merely
-  downloaded and launched; run them directly.
-- **Full TUI parity** — the batch UI is replaced by subcommands plus a small
-  `menu`; scriptable beats coloured `echo` lines.
+- **cmdmax.exe** — its job was resizing console windows on Windows. The keypad
+  is now `remote` in any terminal, the device list is `devices`/`history`,
+  the console diagnostics are `doctor`, and mirroring is `screen scrcpy`.
+- **Self-overwriting Dropbox updater** — the original downloaded a zip and
+  unpacked it over its own folder, which is how "v5.0" turned out to be an older
+  build. `update` only reports; `update --beacon <url>` still reads the old
+  `version;url;changelog` file.
+- **uad_gui-windows.exe / PMX / Button Mapper configuration** — separate
+  upstream apps with their own UI. Install them (`catalog`, `store`) and
+  configure them there; the debloat presets are ported natively.
+- **Windows ADB driver installer** — Windows-only. `doctor` reports the adb
+  version and where to get current platform-tools instead.
+- **Google installer / Play Store / Google TV launcher APKs** — the original
+  pulled them from XDA attachments, which rot. `google --dir <folder>` installs
+  the copies you supply in dependency order: installer, services, store, launcher.
+- **Countries list attachment** — a text file about geo-blocked IPs. `doctor`
+  prints the egress country, which is the actionable part.
+- **2000 lines of coloured `echo`** — replaced by the ANSI `menu` (EN/ES) plus
+  subcommands, so the same steps can be scripted.
 
 ## Port notes
 
@@ -74,7 +98,9 @@ atvtools menu
   (and `private_dns_specifier dns.adguard.com`), `settings put global ntp_server`,
   `screencap`, `screenrecord --time-limit`.
 - Tests cover device-list parsing, `pm path` split parsing, density-line
-  parsing, package-list de-duplication, catalog and preset lookups.
+  parsing, package-list de-duplication, catalog and preset lookups, permission
+  scans, keycode/shorthand expansion, m3u name sanitising, aapt badging parsing,
+  adb version detection, beacon parsing and the Google install order.
 
 ## Feature parity with the original Windows tool
 
@@ -89,7 +115,7 @@ the user; **no** = not ported.
 | Ad blocker (remove ads) | yes | `settings adblock-on` / `adblock-off` / `dns` |
 | Install AdGuard for Android TV | yes | `install adguard-tv` |
 | Send text from PC to TV | yes | `device text "hello world"` |
-| Send files / fetch files from the TV | partial | `adb push` / `adb pull`, or `shell` — no dedicated wrapper |
+| Send files / fetch files from the TV | yes | `transfer push\|pull\|ls\|mkdir` (adb; no FTP app on the TV) |
 | Sideload install / bulk install | yes | `apps install a.apk b.apk`, `apps restore <dir>` |
 | Uninstall apps | yes | `apps uninstall <pkg...>` |
 | Enable/disable apps | yes | `apps disable/enable <pkg...>` |
@@ -106,15 +132,15 @@ the user; **no** = not ported.
 | Enable/disable Play Protect | yes | `toggle play-protect` |
 | Rotate the TV screen | yes | `rotate <0-3>` |
 | Ambient display on/off | yes | `toggle ambient-display` |
-| Ambient activation timeout / idle-off timeout | no | build-specific keys the script wrote per model; not ported |
-| Replace the launcher (Projectivy, FLauncher, ...) | partial | `install flauncher`, `launcher list`, `launcher set <component>` |
-| Install Google TV launcher / Play Store / Google installer on bare devices | no | the original downloaded those APKs from XDA attachments; no stable URL to bundle |
+| Ambient activation timeout / idle-off timeout | yes | `settings idle-timeout <seconds>` writes both keys and reads back what stuck |
+| Replace the launcher (Projectivy, FLauncher, ...) | yes | `install projectivy`, `install flauncher`, `launcher list`, `launcher set <component>` |
+| Install Google TV launcher / Play Store / Google installer on bare devices | yes | `google --dir <folder>` installs your copies in dependency order |
 | Replace YouTube with SmartTube (stable/beta/bridge) | yes | `install smarttube`, `preset apply youtube-tv` |
 | Set any launcher as default | yes | `launcher set` |
 | Replace the screen saver (Aerial Views) | partial | `screensaver <component>` / `screensaver off`; component must be installed first |
-| Customize remote buttons (Button Mapper) | no | app-side configuration; only its install step existed |
-| Install IPTV apps (TiviMate, Kodi, TDTChannels) | partial | `store <pkg>` opens the Play listing on the TV; Kodi ships by sideload |
-| Add m3u lists by URL or file | yes | `device url <m3u-url>` |
+| Customize remote buttons (Button Mapper) | partial | `store flar2.homebutton` installs it; the mapping is app-side |
+| Install IPTV apps (TiviMate, Kodi, TDTChannels) | yes | `iptv install tivimate\|kodi\|tdtchannels\|vlc` |
+| Add m3u lists by URL or file | yes | `iptv open <url>` (player app), `iptv add <url>` (copy into the TV), `iptv list` |
 | Auto-start an app (Launch on Boot) | yes | `install launch-on-boot` (which app is app-side) |
 | Alternative stores (Aurora, Aptoide TV) | yes | `install aurora`, `install aptoide` |
 | Change screen density | yes | `settings set-density <dpi>` / `reset-density` |
@@ -128,16 +154,22 @@ the user; **no** = not ported.
 | Record the screen to MP4 on the PC | yes | `screen record --seconds 30` |
 | Optimize: animations, cache, background apps | partial | `optimize` (animation scales, `pm trim-caches`, `am kill-all`) |
 | Delete an app's data and cache | yes | `apps clear <pkg>` |
-| Voice commands (predefined or custom) | partial | `device text`; no assistant-intent wrapper |
+| Voice commands (predefined or custom) | yes | `voice <text>` fires the assistant key, then dictates |
 | Shortcuts to settings screens | yes | `device screen <page>`, `device screens` |
+| Remote control without cmdmax | yes | `remote` (interactive keypad), `remote uudok` (scripted) |
+| APK labels and versions (on-device aapt) | yes | `apk info <file>`, `apk list <dir>` — read on the PC, nothing written to /data/local/tmp |
+| Dropbox version beacon | yes | `update --beacon <url>`; plain `update` checks GitHub releases |
+| ES/EN localisation (two EXEs in the original) | yes | `menu --lang es`, or press L inside the menu |
+| Country list helper | yes | `doctor` prints the egress country |
+| Windows ADB driver install | partial | `doctor` reports the adb version and the platform-tools hint; it does not install drivers |
 | Launch installed user apps | yes | `apps launch <pkg>` |
 | Wake / sleep the TV | yes | `device wake`, `device sleep` |
-| Check for TV updates | no | per-OEM `dumpsys` keys; not ported |
+| Check for TV updates | partial | `settings ota [--off\|--on]` blocks/allows OTA; firmware checks stay per-OEM |
 | Open the notification shade | yes | `device notifications` |
 | Device info (serial, build, Android version, resolution, battery) | yes | `info` |
 | History of connected TVs | yes | `history` (also appended on `connect`) |
-| Suggest the TV IP | partial | `mdns` via adb mDNS discovery |
+| Suggest the TV IP | yes | `mdns` (adb mDNS discovery), `doctor` |
 | Launcher shortcut icons for hidden apps | partial | `apps shortcuts` prints label + Play Store URL pairs (what the original's helper site consumed) |
 
-**Counted:** ~42 yes, ~12 partial, ~6 no of 60 listed items — roughly 85% of the listed feature
+**Counted:** 52 yes, 8 partial, 0 no of 60 listed items — roughly 87% of the listed feature surface works with a single command; the partial ones are one manual step away.
 surface works with a single command, and the partial ones are one manual step away.

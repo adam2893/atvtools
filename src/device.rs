@@ -149,6 +149,17 @@ pub fn info(adb: &Adb) -> Result<Vec<(String, String)>> {
 }
 
 /// Animation scales, cache trim, background app kill - the script's option 8.
+/// Voice/assistant: fire the assistant key, then dictate text into whatever
+/// opened. Predefined phrases only exist inside each assistant app.
+pub fn assist(adb: &Adb, words: &[String]) -> Result<()> {
+    key(adb, &["assistant".to_string()])?;
+    if !words.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        text(adb, words)?;
+    }
+    Ok(())
+}
+
 pub fn optimize(adb: &Adb) -> Result<()> {
     for (k, v) in [
         ("window_animation_scale", "0.5"),
