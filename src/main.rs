@@ -34,8 +34,9 @@ struct Cli {
     #[arg(short, long, global = true)]
     serial: Option<String>,
 
+    /// Subcommand; bare `atvtools` opens the interactive menu.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -403,7 +404,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let adb = Adb::new(cli.serial.clone());
 
-    match cli.cmd {
+    let cmd = cli.cmd.unwrap_or(Cmd::Menu { lang: "en".to_string() });
+    match cmd {
         Cmd::Devices => {
             for d in adb.devices()? {
                 println!("{}\t{}\t{}", d.serial, d.state, d.model.unwrap_or_default());

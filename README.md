@@ -32,7 +32,8 @@ atvtools -s 192.168.1.50:5555 settings adblock-on
 atvtools -s 192.168.1.50:5555 screen shot shot.png
 atvtools -s 192.168.1.50:5555 install smarttube
 atvtools -s 192.168.1.50:5555 preset apply google-tv-ads --yes
-atvtools menu                    # or: atvtools menu --lang es
+atvtools                         # bare invocation = the interactive menu
+atvtools menu --lang es
 
 # added over the Windows tool
 atvtools -s 192.168.1.50:5555 remote                 # keypad in this terminal
