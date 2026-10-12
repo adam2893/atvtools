@@ -58,6 +58,7 @@ atvtools uad list                # installed packages the UAD database flags as 
 atvtools uad apply --level recommended --yes   # disable all of them at once
 atvtools uad info com.google.android.youtube  # what the database says about one package
 atvtools uad refresh             # re-download the database into ~/.atvtools
+atvtools uad gui                 # run the upstream UAD window (downloaded once to ~/.atvtools/uad)
 ```
 
 ## GUI
@@ -104,12 +105,14 @@ last 400 lines of what was executed.
   unpacked it over its own folder, which is how "v5.0" turned out to be an older
   build. `update` only reports; `update --beacon <url>` still reads the old
   `version;url;changelog` file.
-- **The UAD GUI / PMX / Button Mapper configuration** — separate upstream apps
-  with their own UI. UAD itself is cross-platform (Rust + GTK4; 0.5.1 ships
-  `uad_gui-linux`, `uad_gui-macos` and `uad_gui-windows`); only the Windows
+- **The UAD GUI** — not rewritten, but launched: `uad gui` downloads the
+  upstream cross-platform build for this OS (0.5.1 ships `uad_gui-linux`,
+  `uad_gui-macos`, `uad_gui-windows`) into `~/.atvtools/uad` and runs it with
+  the same adb on PATH and `ANDROID_SERIAL` set to `-s`. Only the Windows
   build was ever downloaded by the original batch. The database queries are
-  ported natively here (`uad`), the GUI is not. PMX and Button Mapper are
-  Android apps: install them with `store` and configure them on the TV.
+  also ported natively (`uad list/info/apply`), so the window is optional.
+- **PMX / Button Mapper configuration** — Android apps with their own UI.
+  Install them with `store` and configure them on the TV.
 - **Windows ADB driver installer** — Windows-only. `doctor` reports the adb
   version and where to get current platform-tools instead.
 - **Google installer / Play Store / Google TV launcher APKs** — the original
@@ -165,7 +168,7 @@ the user; **no** = not ported.
 | Uninstall apps | yes | `apps uninstall <pkg...>` |
 | Enable/disable apps | yes | `apps disable/enable <pkg...>` |
 | Package name + version recognition | yes | `apps info <pkg>`, `apps list --paths --installer` |
-| Universal Android Debloater | yes | `uad list/info/apply/refresh` runs the upstream database (2400 entries, Recommended/Advanced/Expert/Unsafe) natively, plus the TV-specific `preset` list; the GUI's Debloat tab drives the same scan. UAD is cross-platform (Rust + GTK4), but the original batch downloaded only its `uad_gui-windows.exe` build |
+| Universal Android Debloater | yes | `uad list/info/apply/refresh` runs the upstream database (2400 entries, Recommended/Advanced/Expert/Unsafe) natively, plus the TV-specific `preset` list; the GUI's Debloat tab drives the same scan. Upstream's own cross-platform window is on tap with `uad gui` (its `uad_gui-windows.exe` was all the original batch ever downloaded) |
 | Back up / restore all apps | yes | `apps backup-all`, `apps restore <dir>` |
 | List Play-Store-installed apps (and non-Play ones) | yes | `apps list --play-only --installer` |
 | Manage permissions; list packages holding one | yes | `apps grant/revoke`, `apps with-permission <perm>` |

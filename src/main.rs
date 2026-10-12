@@ -235,6 +235,12 @@ enum UadOp {
     },
     /// The database entry for one package.
     Info { package: String },
+    /// Run the upstream cross-platform UAD GUI (downloaded once, ~/.atvtools/uad).
+    Gui {
+        /// Re-download even when a copy is already unpacked.
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Disable every flagged package (pm disable-user --user 0).
     Apply {
         #[arg(long, default_value = "recommended")]
@@ -790,6 +796,9 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 apps::set_enabled(&adb, &pkgs, false)?;
+            }
+            UadOp::Gui { refresh } => {
+                println!("{}", uad::launch_gui(&adb, refresh)?);
             }
             UadOp::Refresh => {
                 let db = uad::load(true)?;
