@@ -10,13 +10,17 @@ talks to `adb` directly on macOS, Linux and Windows.
 ## Build
 
 ```sh
-cargo build --release      # target/release/atvtools
-cargo test                 # unit tests (31)
+cargo build --release      # target/release/atvtools (CLI + GUI)
+cargo test                 # unit tests (45)
 ```
 
 Requirements: `adb` on PATH, or `ADB=/path/to/adb`. `curl` is used for
 downloads (`scrcpy` for mirroring) and both are optional; `SCRCPY` overrides
 the mirroring binary.
+
+Two front ends, one binary: `atvtools gui` opens a native window, bare
+`atvtools` opens the terminal menu, and every command below is also a plain
+subcommand for scripting.
 
 ## Usage
 
@@ -35,6 +39,7 @@ atvtools -s 192.168.1.50:5555 install smarttube
 atvtools -s 192.168.1.50:5555 preset apply google-tv-ads --yes
 atvtools                         # bare invocation = the interactive menu
 atvtools menu --lang es
+atvtools gui                     # native window: Connect / Apps / Debloat / Settings / Screen / Remote / Helpers
 
 # added over the Windows tool
 atvtools -s 192.168.1.50:5555 remote                 # keypad in this terminal
@@ -49,7 +54,30 @@ atvtools -s 192.168.1.50:5555 settings ota --off
 atvtools doctor                  # adb version, devices, internet, egress country, OTA
 atvtools update                  # newer release?; update --beacon <url> reads the old Dropbox beacon
 atvtools apk info ./app.apk      # label, version, launch activity (aapt2 on PATH, or AAPT=...)
+atvtools uad list                # installed packages the UAD database flags as safe to remove
+atvtools uad apply --level recommended --yes   # disable all of them at once
+atvtools uad info com.google.android.youtube  # what the database says about one package
+atvtools uad refresh             # re-download the database into ~/.atvtools
 ```
+
+## GUI
+
+`atvtools gui` (or `--serial <host:port>` to start already aimed at a TV) opens
+an [egui](https://github.com/emilk/egui) window with the same reach as the CLI:
+
+| Tab | What is there |
+|---|---|
+| Connect | type or scan for the TV, connect, list attached devices |
+| Apps | scope filter, package table, tick rows, then disable / enable / uninstall / launch / force stop / info |
+| Debloat | pick a scope and a UAD removal level, scan, tick, disable or re-enable |
+| Settings | density, font scale, AdGuard DNS, OTA blocking, the on/off toggles, settings-screen shortcuts |
+| Screen | screenshot, timed screen recording, scrcpy |
+| Remote | every keycode as a button, plus text, URL, wake/sleep/reboot and the notification shade |
+| Helpers | doctor, device info, optimize, update check, catalog installs |
+
+Everything the GUI runs it runs through the same modules as the CLI, so a button
+and its subcommand behave identically. The activity pane at the bottom keeps the
+last 400 lines of what was executed.
 
 ## Original menu → this CLI
 
@@ -104,10 +132,17 @@ atvtools apk info ./app.apk      # label, version, launch activity (aapt2 on PAT
   `settings put system font_scale`, `settings put global private_dns_mode`
   (and `private_dns_specifier dns.adguard.com`), `settings put global ntp_server`,
   `screencap`, `screenrecord --time-limit`.
+- The debloat database is the upstream `uad_lists.json` fetched at runtime and
+  cached in `~/.atvtools/uad_lists.json`; `uad refresh` re-downloads it. It is
+  written for phones, so a few TV-only packages (for example
+  `com.google.android.youtube.tv` and the leanback launchers) are absent from it
+  and are covered by the built-in presets instead.
 - Tests cover device-list parsing, `pm path` split parsing, density-line
   parsing, package-list de-duplication, catalog and preset lookups, permission
   scans, keycode/shorthand expansion, m3u name sanitising, aapt badging parsing,
-  adb version detection, beacon parsing and the Google install order.
+  adb version detection, beacon parsing, the Google install order and the UAD
+  database levels/sorting. The GUI is not unit-tested: it is a thin shell over the
+  same functions the tests cover, so it is exercised by running it.
 
 ## Feature parity with the original Windows tool
 
@@ -127,7 +162,7 @@ the user; **no** = not ported.
 | Uninstall apps | yes | `apps uninstall <pkg...>` |
 | Enable/disable apps | yes | `apps disable/enable <pkg...>` |
 | Package name + version recognition | yes | `apps info <pkg>`, `apps list --paths --installer` |
-| Universal Android Debloater | partial | built-in `preset list/apply` (native port); upstream UAD not bundled |
+| Universal Android Debloater | yes | `uad list/info/apply/refresh` runs the upstream database (2400 entries, Recommended/Advanced/Expert/Unsafe) natively, plus the TV-specific `preset` list; the GUI's Debloat tab drives the same scan. The original only downloaded `uad_gui-windows.exe` |
 | Back up / restore all apps | yes | `apps backup-all`, `apps restore <dir>` |
 | List Play-Store-installed apps (and non-Play ones) | yes | `apps list --play-only --installer` |
 | Manage permissions; list packages holding one | yes | `apps grant/revoke`, `apps with-permission <perm>` |
@@ -178,5 +213,7 @@ the user; **no** = not ported.
 | Suggest the TV IP | yes | `mdns` (adb mDNS discovery), `doctor` |
 | Launcher shortcut icons for hidden apps | partial | `apps shortcuts` prints label + Play Store URL pairs (what the original's helper site consumed) |
 
-**Counted:** 52 yes, 8 partial, 0 no of 60 listed items — roughly 87% of the listed feature surface works with a single command; the partial ones are one manual step away.
-surface works with a single command, and the partial ones are one manual step away.
+**Counted:** 53 yes, 7 partial, 0 no of 60 listed items — roughly 88% of the listed
+feature surface works with a single command; the partial ones are one manual step away.
+
+The GUI adds no row: every tab is listed above as its CLI equivalent.

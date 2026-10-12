@@ -370,9 +370,9 @@ fn action(lang: Lang, target: &mut Target, choice: &str) -> Result<()> {
             }
             "8" => {
                 let adb = target.adb(lang)?;
-                crate::doctor::run(&adb)?;
+                print!("{}", crate::doctor::run(&adb)?);
             }
-            "9" => crate::update::check(env!("CARGO_PKG_VERSION"), None)?,
+            "9" => print!("{}", crate::update::check(env!("CARGO_PKG_VERSION"), None)?),
             other => println!("{} {other}", lang.t("unknown")),
     }
     Ok(())

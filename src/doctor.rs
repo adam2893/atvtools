@@ -5,6 +5,7 @@
 
 use crate::adb::Adb;
 use anyhow::Result;
+use std::fmt::Write as _;
 use std::process::Command;
 
 /// Below this, wireless debugging and modern pm commands misbehave.
@@ -35,51 +36,57 @@ pub fn older_than(v: (u32, u32, u32), min: (u32, u32, u32)) -> bool {
     v < min
 }
 
-pub fn run(adb: &Adb) -> Result<()> {
-    println!("adb binary     : {}", adb.bin);
+/// The whole report as text, so the CLI and the GUI can both show it.
+pub fn run(adb: &Adb) -> Result<String> {
+    let mut out = String::new();
+    let _ = writeln!(out, "adb binary     : {}", adb.bin);
     match Command::new(&adb.bin).arg("version").output() {
         Ok(o) => {
             let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
             match parse_adb_version(&text) {
                 Some(v) => {
-                    println!("adb version    : {}.{}.{}", v.0, v.1, v.2);
+                    let _ = writeln!(out, "adb version    : {}.{}.{}", v.0, v.1, v.2);
                     if older_than(v, MIN_ADB) {
-                        println!("                 -> older than {}.{}.{}; install current platform-tools", MIN_ADB.0, MIN_ADB.1, MIN_ADB.2);
+                        let _ = writeln!(out, "                 -> older than {}.{}.{}; install current platform-tools", MIN_ADB.0, MIN_ADB.1, MIN_ADB.2);
                     }
                 }
-                None => println!("adb version    : unrecognised output"),
+                None => {
+                    let _ = writeln!(out, "adb version    : unrecognised output");
+                }
             }
         }
-        Err(e) => println!("adb version    : cannot run ({}); install platform-tools and put adb on PATH", e.kind()),
+        Err(e) => {
+            let _ = writeln!(out, "adb version    : cannot run ({}); install platform-tools and put adb on PATH", e.kind());
+        }
     }
 
     let devices = adb.devices().unwrap_or_default();
-    println!("devices        : {}", devices.len());
+    let _ = writeln!(out, "devices        : {}", devices.len());
     for d in &devices {
-        println!("                 {} {} {}", d.serial, d.state, d.model.clone().unwrap_or_default());
+        let _ = writeln!(out, "                 {} {} {}", d.serial, d.state, d.model.clone().unwrap_or_default());
     }
     if devices.is_empty() {
-        println!("                 -> enable developer options on the TV, then: atvtools connect <tv-ip>");
+        let _ = writeln!(out, "                 -> enable developer options on the TV, then: atvtools connect <tv-ip>");
     }
     for d in devices.iter().filter(|d| d.state != "device") {
         let why = crate::adb::advice(&d.state);
-        println!("                 -> {} is {}{}", d.serial, d.state, if why.is_empty() { String::new() } else { format!(": {why}") });
+        let _ = writeln!(out, "                 -> {} is {}{}", d.serial, d.state, if why.is_empty() { String::new() } else { format!(": {why}") });
     }
 
     let online = crate::download::fetch_text("https://ipinfo.io/country").ok();
-    println!("internet       : {}", if online.is_some() { "yes" } else { "no (/ catalogue installs will fail)" });
+    let _ = writeln!(out, "internet       : {}", if online.is_some() { "yes" } else { "no (/ catalogue installs will fail)" });
     if let Some(country) = online {
         let c = country.trim();
-        println!("egress country : {c}");
-        println!("                 -> Play Store installs fail when this is a VPN exit in the wrong region");
+        let _ = writeln!(out, "egress country : {c}");
+        let _ = writeln!(out, "                 -> Play Store installs fail when this is a VPN exit in the wrong region");
     }
 
     if !devices.is_empty() {
         if let Ok(ota) = crate::settings::ota_state(adb) {
-            println!("ota updates    : {ota}   (atvtools settings ota --off blocks them)");
+            let _ = writeln!(out, "ota updates    : {ota}   (atvtools settings ota --off blocks them)");
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+eframe = "0.36.2"
+serde_json = "1.0.154"
 
 [profile.release]
 strip = true

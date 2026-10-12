@@ -13,6 +13,7 @@ mod device;
 mod doctor;
 mod download;
 mod google;
+mod gui;
 mod iptv;
 mod menu;
 mod net;
@@ -21,6 +22,7 @@ mod screen;
 mod settings;
 mod shizuku;
 mod transfer;
+mod uad;
 mod update;
 
 use adb::Adb;
@@ -159,6 +161,13 @@ enum Cmd {
         #[arg(long, default_value = "en")]
         lang: String,
     },
+    /// Debloat with the universal-android-debloater package database.
+    Uad {
+        #[command(subcommand)]
+        op: UadOp,
+    },
+    /// Native desktop window (needs a display).
+    Gui,
 }
 
 #[derive(Subcommand, Debug)]
@@ -202,6 +211,38 @@ enum ApkOp {
     Info { file: PathBuf },
     /// Every .apk in a folder, in install order.
     List { dir: PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+enum UadOp {
+    /// Installed packages UAD flags, at or below a removal level.
+    List {
+        #[arg(long, default_value = "recommended")]
+        level: String,
+        #[arg(long, value_enum, default_value_t = ScopeArg::All)]
+        scope: ScopeArg,
+        /// Re-download the database first.
+        #[arg(long)]
+        refresh: bool,
+        /// Print every line of the description, not just the first.
+        #[arg(long)]
+        full: bool,
+    },
+    /// The database entry for one package.
+    Info { package: String },
+    /// Disable every flagged package (pm disable-user --user 0).
+    Apply {
+        #[arg(long, default_value = "recommended")]
+        level: String,
+        #[arg(long, value_enum, default_value_t = ScopeArg::All)]
+        scope: ScopeArg,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Re-download the database into ~/.atvtools.
+    Refresh,
 }
 
 #[derive(Subcommand, Debug)]
@@ -338,6 +379,16 @@ enum ScopeArg {
     ThirdParty,
     System,
     All,
+}
+
+impl ScopeArg {
+    fn as_scope(self) -> apps::Scope {
+        match self {
+            ScopeArg::ThirdParty => apps::Scope::ThirdParty,
+            ScopeArg::System => apps::Scope::System,
+            ScopeArg::All => apps::Scope::All,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -658,8 +709,8 @@ fn main() -> Result<()> {
                 None => println!("{}", iptv::players()),
             },
         },
-        Cmd::Doctor => doctor::run(&adb)?,
-        Cmd::Update { beacon } => update::check(env!("CARGO_PKG_VERSION"), beacon.as_deref())?,
+        Cmd::Doctor => print!("{}", doctor::run(&adb)?),
+        Cmd::Update { beacon } => print!("{}", update::check(env!("CARGO_PKG_VERSION"), beacon.as_deref())?),
         Cmd::Apk { op } => match op {
             ApkOp::Info { file } => {
                 let b = apk::info(&file)?;
@@ -683,6 +734,59 @@ fn main() -> Result<()> {
         Cmd::Google { dir } => google::install(&adb, &dir)?,
         Cmd::Voice { words } => device::assist(&adb, &words)?,
         Cmd::Menu { lang } => menu::run(&lang)?,
+        Cmd::Uad { op } => match op {
+            UadOp::List { level, scope, refresh, full } => {
+                let hits = uad::scan(&adb, scope.as_scope(), &level, refresh)?;
+                if hits.is_empty() {
+                    println!("nothing installed is flagged at level '{level}'");
+                }
+                for h in hits {
+                    println!("{:<11} {:<7} {}", h.removal, h.list, h.package);
+                    let lines = h.description.lines().filter(|l| !l.trim().is_empty());
+                    if full {
+                        for line in lines {
+                            println!("             {line}");
+                        }
+                    } else if let Some(first) = lines.into_iter().next() {
+                        println!("             {first}");
+                    }
+                }
+            }
+            UadOp::Info { package } => {
+                let db = uad::load(false)?;
+                match uad::find(&db, &package) {
+                    Some(e) => {
+                        println!("{} ({})", e.id, e.list);
+                        println!("removal: {}", e.removal);
+                        for line in e.description.lines() {
+                            println!("{line}");
+                        }
+                    }
+                    None => println!("{package} is not in the UAD database"),
+                }
+            }
+            UadOp::Apply { level, scope, refresh, yes } => {
+                let hits = uad::scan(&adb, scope.as_scope(), &level, refresh)?;
+                if hits.is_empty() {
+                    println!("nothing installed is flagged at level '{level}'");
+                    return Ok(());
+                }
+                for h in &hits {
+                    println!("{:<11} {}", h.removal, h.package);
+                }
+                let pkgs: Vec<String> = hits.iter().map(|h| h.package.clone()).collect();
+                if !yes && !confirm(&format!("disable {} packages at level '{level}'? (atvtools uad apply level unsafe --yes to be blunt)", pkgs.len()))? {
+                    println!("aborted");
+                    return Ok(());
+                }
+                apps::set_enabled(&adb, &pkgs, false)?;
+            }
+            UadOp::Refresh => {
+                let db = uad::load(true)?;
+                println!("{} packages cached at {}", db.len(), uad::cache_path().map(|p| p.display().to_string()).unwrap_or_else(|| "?".to_string()));
+            }
+        },
+        Cmd::Gui => gui::run(cli.serial.clone())?,
     }
     Ok(())
 }

@@ -4,6 +4,7 @@
 //! This checks the project's own releases and never self-overwrites.
 
 use anyhow::Result;
+use std::fmt::Write as _;
 
 pub const REPO_API: &str = "https://api.github.com/repos/adam2893/atvtools/releases/latest";
 
@@ -55,38 +56,43 @@ pub fn is_newer(current: &str, remote: &str) -> bool {
 }
 
 /// Check the release feed, or a legacy beacon URL when one is given.
-pub fn check(current: &str, beacon: Option<&str>) -> Result<()> {
+pub fn check(current: &str, beacon: Option<&str>) -> Result<String> {
+    let mut out = String::new();
     match beacon {
         Some(url) => {
             let body = crate::download::fetch_text(url)?;
             let b = parse_beacon(&body).ok_or_else(|| anyhow::anyhow!("unreadable beacon at {url}"))?;
-            println!("beacon version : {}", b.version);
-            println!("beacon payload : {}", b.url);
+            let _ = writeln!(out, "beacon version : {}", b.version);
+            let _ = writeln!(out, "beacon payload : {}", b.url);
             if !b.changelog.is_empty() {
-                println!("changelog      : {}", b.changelog);
+                let _ = writeln!(out, "changelog      : {}", b.changelog);
             }
             if is_newer(current, &b.version) {
-                println!("-> a newer build is advertised: {}", b.version);
+                let _ = writeln!(out, "-> a newer build is advertised: {}", b.version);
             } else {
-                println!("-> up to date (running {current})");
+                let _ = writeln!(out, "-> up to date (running {current})");
             }
         }
         None => {
             // offline, or nothing published yet: neither is an error here
             let Ok(body) = crate::download::fetch_text(REPO_API) else {
-                println!("no release feed reachable (running {current})");
-                return Ok(());
+                let _ = writeln!(out, "no release feed reachable (running {current})");
+                return Ok(out);
             };
             match parse_tag(&body) {
                 Some(tag) if is_newer(current, &tag) => {
-                    println!("{tag} is available (running {current}): https://github.com/adam2893/atvtools/releases")
+                    let _ = writeln!(out, "{tag} is available (running {current}): https://github.com/adam2893/atvtools/releases");
                 }
-                Some(_) => println!("up to date ({current})"),
-                None => println!("no release published yet (running {current})"),
+                Some(_) => {
+                    let _ = writeln!(out, "up to date ({current})");
+                }
+                None => {
+                    let _ = writeln!(out, "no release published yet (running {current})");
+                }
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 #[cfg(test)]
