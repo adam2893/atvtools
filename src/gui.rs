@@ -555,7 +555,7 @@ impl App {
             }
             if ui.button("optimize (animations, cache)").clicked() {
                 self.act("optimize", |adb| {
-                    device::optimize(adb).map(|_| "animation scales and caches trimmed".to_string())
+                    device::optimize(adb)
                 });
             }
             if ui.button("check for updates").clicked() {
@@ -573,6 +573,9 @@ impl App {
                     let name = e.name.to_string();
                     let label = name.clone();
                     self.act(&label, move |adb| {
+                        let abis = catalog::abis(adb);
+                        let abis: Vec<&str> = abis.iter().map(String::as_str).collect();
+                        let url = catalog::resolve(&url, &abis)?;
                         let dest = std::env::temp_dir().join("atvtools").join(format!("{name}.apk"));
                         download::fetch(&url, &dest)?;
                         apps::install(adb, &[dest])?;

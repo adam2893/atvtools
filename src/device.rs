@@ -160,17 +160,21 @@ pub fn assist(adb: &Adb, words: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub fn optimize(adb: &Adb) -> Result<()> {
+pub fn optimize(adb: &Adb) -> Result<String> {
+    use std::fmt::Write;
+    let mut s = String::new();
     for (k, v) in [
         ("window_animation_scale", "0.5"),
         ("transition_animation_scale", "0.5"),
         ("animator_duration_scale", "0.5"),
     ] {
         adb.shell(&format!("settings put global {k} {v}"))?;
+        let _ = writeln!(s, "{k} = {}", adb.try_out(&["shell", "settings get global", k]).trim());
     }
-    println!("{}", adb.try_out(&["shell", "pm trim-caches 1000M"]).trim());
+    let _ = writeln!(s, "cache trim: {}", adb.try_out(&["shell", "pm trim-caches 1000M"]).trim());
     adb.try_out(&["shell", "am kill-all"]);
-    Ok(())
+    let _ = writeln!(s, "background apps killed");
+    Ok(s)
 }
 
 #[cfg(test)]

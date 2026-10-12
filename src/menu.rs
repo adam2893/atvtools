@@ -292,15 +292,27 @@ fn action(lang: Lang, target: &mut Target, choice: &str) -> Result<()> {
             "1" => {
                 let adb = target.adb(lang)?;
                 println!("1 push a file   2 pull a file   3 list {}/", crate::transfer::DOWNLOADS);
-                let local = ask("local path")?;
-                match ask("")?.as_str() {
-                    "1" => crate::transfer::push(&adb, std::path::Path::new(&local), crate::transfer::DOWNLOADS)?,
-                    "2" => crate::transfer::pull(
-                        &adb,
-                        &local,
-                        std::path::Path::new(&ask("save as")?),
-                    )?,
-                    _ => println!("{}", crate::transfer::ls(&adb, crate::transfer::DOWNLOADS)?),
+                // Ask what to do first: the original asked for the path before the choice.
+                match ask("")?.trim() {
+                    "1" => {
+                        let local = ask("local file")?;
+                        crate::transfer::push(&adb, std::path::Path::new(&local), crate::transfer::DOWNLOADS)?;
+                    }
+                    "2" => {
+                        let remote = ask("file on the TV")?;
+                        let save = ask("save as (empty = its own name)")?;
+                        let save = if save.is_empty() {
+                            std::path::Path::new(&remote)
+                                .file_name()
+                                .map(|f| f.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "pulled.bin".to_string())
+                        } else {
+                            save
+                        };
+                        crate::transfer::pull(&adb, &remote, std::path::Path::new(&save))?;
+                    }
+                    "3" | "" => println!("{}", crate::transfer::ls(&adb, crate::transfer::DOWNLOADS)?),
+                    other => println!("{} {other}", lang.t("unknown")),
                 }
             }
             "2" => {
@@ -351,7 +363,13 @@ fn action(lang: Lang, target: &mut Target, choice: &str) -> Result<()> {
                 let name = ask("install which app (empty = keep)")?;
                 if !name.is_empty() {
                     let adb = target.adb(lang)?;
-                    crate::download::install_catalog(&adb, &name)?;
+                    if let Err(e) = crate::download::install_catalog(&adb, &name) {
+                        println!("{e}");
+                        let yes = ask("replace the installed copy with this build (y/N)")?;
+                        if yes.trim().eq_ignore_ascii_case("y") {
+                            crate::download::install_catalog_with(&adb, &name, true)?;
+                        }
+                    }
                 }
             }
             "6" => {
@@ -366,7 +384,7 @@ fn action(lang: Lang, target: &mut Target, choice: &str) -> Result<()> {
             }
             "7" => {
                 let adb = target.adb(lang)?;
-                device::optimize(&adb)?;
+                print!("{}", device::optimize(&adb)?);
             }
             "8" => {
                 let adb = target.adb(lang)?;

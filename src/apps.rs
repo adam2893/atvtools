@@ -32,15 +32,60 @@ pub fn parse_package_list(raw: &str) -> Vec<String> {
 }
 
 pub fn install(adb: &Adb, apks: &[PathBuf]) -> Result<()> {
+    install_with(adb, apks, false)
+}
+
+/// -r reinstalls, -g grants runtime permissions (both used by the original).
+/// With replace, a signature clash (another build of the same package is already
+/// installed - the official Shizuku next to the fork, for example) removes the
+/// existing package for user 0 and installs again.
+pub fn install_with(adb: &Adb, apks: &[PathBuf], replace: bool) -> Result<()> {
     if apks.is_empty() {
         bail!("no apk given");
     }
     for apk in apks {
         let path = apk.to_string_lossy().to_string();
-        // -r reinstall, -g grant runtime permissions (both used by the original).
         let out = adb.out(&["install", "-r", "-g", &path])?;
+        if let Some(pkg) = mismatch_package(&out) {
+            if !replace {
+                bail!(
+                    "{pkg} is already installed from a different build ({}).
+  -> re-run with --replace to remove that copy first, or run: atvtools apps uninstall {pkg}",
+                    out.trim()
+                );
+            }
+            remove_any_version(adb, &pkg)?;
+            let again = adb.out(&["install", "-r", "-g", &path])?;
+            println!("{}: {} (replaced the previously installed {pkg})", apk.display(), again.trim());
+            continue;
+        }
         println!("{}: {}", apk.display(), out.trim());
     }
+    Ok(())
+}
+
+/// The package named by INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+pub fn mismatch_package(out: &str) -> Option<String> {
+    if !out.contains("signatures do not match") && !out.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") {
+        return None;
+    }
+    const MARK: &str = "Existing package ";
+    let at = out.find(MARK)? + MARK.len();
+    let name: String = out[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// User 0 first: it also clears packages that cannot be removed outright.
+fn remove_any_version(adb: &Adb, pkg: &str) -> Result<()> {
+    let _ = adb.try_out(&["shell", &format!("pm uninstall --user 0 {pkg}")]);
+    let _ = adb.try_out(&["uninstall", pkg]);
     Ok(())
 }
 
@@ -319,6 +364,13 @@ pub fn open_store(adb: &Adb, package: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_clashing_package_is_read_from_the_error() {
+        let real = "Performing Streamed Installadb: failed to install /tmp/a.apk: Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package moe.shizuku.privileged.api signatures do not match newer version; ignoring!]";
+        assert_eq!(mismatch_package(real).as_deref(), Some("moe.shizuku.privileged.api"));
+        assert_eq!(mismatch_package("Success"), None);
+    }
 
     #[test]
     fn store_url_is_built() {

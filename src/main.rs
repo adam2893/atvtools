@@ -70,7 +70,12 @@ enum Cmd {
     /// Show the installer catalog.
     Catalog,
     /// Download and install a catalog app by name.
-    Install { name: String },
+    Install {
+        name: String,
+        /// Remove an existing copy first when its signature differs
+        #[arg(long)]
+        replace: bool,
+    },
     /// Debloat presets.
     Preset {
         #[command(subcommand)]
@@ -295,7 +300,12 @@ enum AppsOp {
         play_only: bool,
     },
     /// Install one or more APK files.
-    Install { apk: Vec<PathBuf> },
+    Install {
+        apk: Vec<PathBuf>,
+        /// Remove an existing copy first when its signature differs (fork vs official Shizuku)
+        #[arg(long)]
+        replace: bool,
+    },
     /// Uninstall packages for user 0.
     Uninstall { package: Vec<String> },
     /// Disable packages (pm disable-user --user 0).
@@ -531,7 +541,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            AppsOp::Install { apk } => apps::install(&adb, &apk)?,
+            AppsOp::Install { apk, replace } => apps::install_with(&adb, &apk, replace)?,
             AppsOp::Uninstall { package } => apps::uninstall(&adb, &package)?,
             AppsOp::Disable { package } => apps::set_enabled(&adb, &package, false)?,
             AppsOp::Enable { package } => apps::set_enabled(&adb, &package, true)?,
@@ -606,7 +616,7 @@ fn main() -> Result<()> {
                 println!("{:<24} {}", e.name, e.note);
             }
         }
-        Cmd::Install { name } => download::install_catalog(&adb, &name)?,
+        Cmd::Install { name, replace } => download::install_catalog_with(&adb, &name, replace)?,
         Cmd::Shizuku { op } => match op {
             ShizukuOp::Install => {
                 let e = catalog::find("shizuku-fork")
@@ -685,7 +695,7 @@ fn main() -> Result<()> {
                 println!("{h}");
             }
         }
-        Cmd::Optimize => device::optimize(&adb)?,
+        Cmd::Optimize => print!("{}", device::optimize(&adb)?),
         Cmd::Transfer { op } => match op {
             TransferOp::Push { local, remote } => transfer::push(&adb, &local, &remote)?,
             TransferOp::Pull { remote, local } => transfer::pull(&adb, &remote, &local)?,
