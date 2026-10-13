@@ -80,7 +80,7 @@ jobs:
           mkdir -p dist
           cp target/release/atvtools.exe README.md dist/
           cd dist
-          tar -a -c -f "../atvtools-${VERSION}-x86_64-pc-windows-msvc.zip" atvtools.exe README.md
+          powershell -NoProfile -Command 'Compress-Archive -Path atvtools.exe, README.md -DestinationPath "../atvtools-$env:VERSION-x86_64-pc-windows-msvc.zip"'
 
       - uses: actions/upload-artifact@v4
         with:
