@@ -474,6 +474,7 @@ dependencies = [
  "anyhow",
  "clap",
  "eframe",
+ "miniz_oxide 0.8.9",
  "serde_json",
 ]
 

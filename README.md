@@ -55,8 +55,9 @@ atvtools -s 192.168.1.50:5555 google --dir ~/Downloads/google-tv-apks
 atvtools -s 192.168.1.50:5555 settings idle-timeout 900
 atvtools -s 192.168.1.50:5555 settings ota --off
 atvtools doctor                  # adb version, devices, internet, egress country, OTA
+atvtools doctor --fix            # restart the adb server, put a USB TV on port 5555
 atvtools update                  # newer release?; update --beacon <url> reads the old Dropbox beacon
-atvtools apk info ./app.apk      # label, version, launch activity (aapt2 on PATH, or AAPT=...)
+atvtools apk info ./app.apk      # package, label, version, launch activity (read in-process; AAPT=<bin> to differ)
 atvtools uad list                # installed packages the UAD database flags as safe to remove
 atvtools uad apply --level recommended --yes   # disable all of them at once
 atvtools uad info com.google.android.youtube  # what the database says about one package
@@ -78,7 +79,7 @@ an [egui](https://github.com/emilk/egui) window with the same reach as the CLI:
 | Settings | density, font scale, AdGuard DNS, OTA blocking, the on/off toggles, settings-screen shortcuts |
 | Screen | screenshot, timed screen recording, scrcpy |
 | Remote | every keycode as a button, plus text, URL, wake/sleep/reboot and the notification shade |
-| Helpers | doctor, device info, optimize, update check, `uad gui`, catalog installs (a tick box removes an existing copy of the same id first, e.g. official Shizuku → fork) |
+| Helpers | doctor, doctor --fix, device info, optimize, update check, `uad gui`, catalog installs (each row's `replace` button removes the other build of the same id first, e.g. official Shizuku → fork) |
 
 Everything the GUI runs it runs through the same modules as the CLI, so a button
 and its subcommand behave identically. The activity pane at the bottom keeps the
@@ -149,7 +150,8 @@ last 400 lines of what was executed.
   and are covered by the built-in presets instead.
 - Tests cover device-list parsing, `pm path` split parsing, density-line
   parsing, package-list de-duplication, catalog and preset lookups, permission
-  scans, keycode/shorthand expansion, m3u name sanitising, aapt badging parsing,
+  scans, keycode/shorthand expansion, m3u name sanitising, APK manifest/resource
+  parsing (with hand-built AXML, arsc and zip fixtures),
   adb version detection, beacon parsing, the Google install order and the UAD
   database levels/sorting. The GUI is not unit-tested: it is a thin shell over the
   same functions the tests cover, so it is exercised by running it.
@@ -209,7 +211,7 @@ the user; **no** = not ported.
 | Voice commands (predefined or custom) | yes | `voice <text>` fires the assistant key, then dictates |
 | Shortcuts to settings screens | yes | `device screen <page>`, `device screens` |
 | Remote control without cmdmax | yes | `remote` (interactive keypad), `remote uudok` (scripted) |
-| APK labels and versions (on-device aapt) | yes | `apk info <file>`, `apk list <dir>` — read on the PC, nothing written to /data/local/tmp |
+| APK labels and versions (on-device aapt) | yes | `apk info <file>`, `apk list <dir>` — read on the PC, in-process, nothing written to /data/local/tmp |
 | Dropbox version beacon | yes | `update --beacon <url>`; plain `update` checks GitHub releases |
 | ES/EN localisation (two EXEs in the original) | yes | `menu --lang es`, or press L inside the menu |
 | Country list helper | yes | `doctor` prints the egress country |

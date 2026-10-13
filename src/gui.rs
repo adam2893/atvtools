@@ -74,7 +74,6 @@ struct App {
     dpi: String,
     scale: String,
     seconds: String,
-    replace: bool,
     remote_path: String,
     local_path: String,
 }
@@ -100,7 +99,6 @@ impl App {
             dpi: String::new(),
             scale: String::new(),
             seconds: "20".to_string(),
-            replace: false,
             remote_path: transfer::DOWNLOADS.to_string(),
             local_path: String::new(),
         };
@@ -609,6 +607,9 @@ impl App {
             if ui.button("doctor").clicked() {
                 self.act("doctor", |adb| crate::doctor::run(adb));
             }
+            if ui.button("doctor --fix").clicked() {
+                self.act("doctor --fix", |adb| crate::doctor::fix(adb));
+            }
             if ui.button("device info").clicked() {
                 self.act("info", |adb| {
                     let rows = device::info(adb)?;
@@ -635,17 +636,17 @@ impl App {
         });
         ui.separator();
         ui.label("Catalog: download and install on the TV");
-        ui.checkbox(
-            &mut self.replace,
-            "replace an existing copy of the same id (removes the other build first)",
-        );
         for e in catalog::CATALOG {
             ui.horizontal(|ui| {
-                if ui.small_button("install").clicked() {
+                let install = ui.small_button("install").clicked();
+                let replace = ui
+                    .small_button("replace")
+                    .on_hover_text("remove the other build of the same id first (official Shizuku -> fork)")
+                    .clicked();
+                if install || replace {
                     let url = e.url.to_string();
                     let name = e.name.to_string();
                     let label = name.clone();
-                    let replace = self.replace;
                     self.act(&label, move |adb| {
                         let abis = catalog::abis(adb);
                         let abis: Vec<&str> = abis.iter().map(String::as_str).collect();

@@ -167,14 +167,20 @@ enum Cmd {
         op: IptvOp,
     },
     /// Preflight: adb, device, internet, region, OTA.
-    Doctor,
+    Doctor {
+        /// Repair what can be repaired here: restart the adb server, and put a
+        /// USB-attached TV into TCP mode on port 5555.
+        #[arg(long)]
+        fix: bool,
+    },
     /// Check for a newer build.
     Update {
         /// Read the old tool's "version;url;changelog" beacon instead.
         #[arg(long)]
         beacon: Option<String>,
     },
-    /// APK metadata for local files (uses the host's aapt2).
+    /// APK metadata for local files: AndroidManifest.xml and resources.arsc are
+    /// parsed here, so no aapt2 is needed (AAPT=<bin> uses that one instead).
     Apk {
         #[command(subcommand)]
         op: ApkOp,
@@ -861,7 +867,12 @@ fn main() -> Result<()> {
                 None => println!("{}", iptv::players()),
             },
         },
-        Cmd::Doctor => print!("{}", doctor::run(&adb)?),
+        Cmd::Doctor { fix } => {
+            if fix {
+                print!("{}", doctor::fix(&adb)?);
+            }
+            print!("{}", doctor::run(&adb)?);
+        }
         Cmd::Update { beacon } => print!("{}", update::check(env!("CARGO_PKG_VERSION"), beacon.as_deref())?),
         Cmd::Apk { op } => match op {
             ApkOp::Info { file } => {
