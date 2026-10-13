@@ -13,6 +13,13 @@ pub const KEYS: &[(&str, u32)] = &[
     ("power", 26), ("wakeup", 224), ("sleep", 223),
     ("settings", 176), ("info", 165), ("tv", 170), ("guide", 172), ("assistant", 219),
     ("del", 67), ("tab", 61),
+    // "wake" is the shorthand remote.rs hands over; without it `remote w`
+    // reported an unknown key.
+    ("wake", 224),
+    // TV hardware keys the keyboards do not have: inputs and tuner controls.
+    ("tv_input", 178), ("hdmi1", 243), ("hdmi2", 244), ("hdmi3", 245), ("hdmi4", 246),
+    ("channelup", 166), ("channeldown", 167), ("last", 229), ("captions", 175), ("teletext", 174),
+    ("record", 130), ("dvr", 173),
 ];
 
 pub fn keycode(name: &str) -> Option<u32> {
@@ -49,6 +56,27 @@ pub fn wake(adb: &Adb) -> Result<()> {
 pub fn sleep(adb: &Adb) -> Result<()> {
     adb.shell("input keyevent 223")?; // KEYCODE_SLEEP
     Ok(())
+}
+
+/// The TV's own MAC, for wake-on-LAN: the two interfaces Android TV uses first,
+/// then whatever `ip link` reports.
+pub fn mac(adb: &Adb) -> Option<String> {
+    for iface in ["wlan0", "eth0"] {
+        let raw = adb.try_out(&["shell", &format!("cat /sys/class/net/{iface}/address")]);
+        if let Some(m) = crate::net::mac_from(&raw) {
+            return Some(m);
+        }
+    }
+    crate::net::mac_from(&adb.try_out(&["shell", "ip link"]))
+}
+
+/// Wake over the network, for a TV that is off-but-listening.
+pub fn wake_lan(adb: &Adb) -> Result<String> {
+    let mac = mac(adb).ok_or_else(|| {
+        anyhow::anyhow!("could not read a MAC address off the TV (it has to be on the network)")
+    })?;
+    crate::net::wake_on_lan(&mac)?;
+    Ok(format!("magic packet sent to {mac}; the TV needs wake-on-LAN enabled to react"))
 }
 
 pub fn reboot(adb: &Adb, mode: Option<&str>) -> Result<()> {

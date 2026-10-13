@@ -35,6 +35,41 @@ pub fn set_font_scale(adb: &Adb, scale: f32) -> Result<()> {
 /// AdGuard DNS-over-TLS host, the same one the original tool installs.
 pub const ADGUARD_DNS: &str = "dns.adguard.com";
 
+/// Providers `settings dns --provider` accepts, with the DoT host each needs.
+pub const DNS_PROVIDERS: &[(&str, &str)] = &[
+    ("adguard", ADGUARD_DNS),
+    ("cloudflare", "1dot1dot1dot1.cloudflare-dns.com"),
+    ("nextdns", "dns.nextdns.io"),
+    ("quad9", "dns.quad9.net"),
+    ("google", "dns.google"),
+];
+
+pub fn provider_names() -> String {
+    DNS_PROVIDERS.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(", ")
+}
+
+/// The hostname for `private_dns_specifier`. NextDNS takes a profile id as a
+/// label; the bare host is its unfiltered anycast endpoint.
+pub fn dns_host(provider: &str, id: Option<&str>) -> Result<String> {
+    let p = provider.trim().to_ascii_lowercase();
+    let host = DNS_PROVIDERS
+        .iter()
+        .find(|(k, _)| *k == p)
+        .map(|(_, h)| *h)
+        .ok_or_else(|| anyhow::anyhow!("unknown DNS provider '{provider}'. known: {}", provider_names()))?;
+    Ok(match (p.as_str(), id) {
+        ("nextdns", Some(i)) if !i.trim().is_empty() => format!("{}.dns.nextdns.io", i.trim()),
+        _ => host.to_string(),
+    })
+}
+
+/// Points private DNS at a host; same mode the ad-block shortcut uses.
+pub fn set_dns(adb: &Adb, host: &str) -> Result<()> {
+    adb.shell("settings put global private_dns_mode hostname")?;
+    adb.shell(&format!("settings put global private_dns_specifier {host}"))?;
+    Ok(())
+}
+
 pub fn adblock_on(adb: &Adb) -> Result<()> {
     adb.shell("settings put global private_dns_mode hostname")?;
     adb.shell(&format!("settings put global private_dns_specifier {ADGUARD_DNS}"))?;

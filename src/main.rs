@@ -15,14 +15,17 @@ mod download;
 mod google;
 mod gui;
 mod iptv;
+mod logs;
 mod menu;
 mod net;
+mod profile;
 mod remote;
 mod screen;
 mod settings;
 mod shizuku;
 mod transfer;
 mod uad;
+mod undo;
 mod update;
 
 use adb::Adb;
@@ -36,6 +39,10 @@ struct Cli {
     /// Device serial (host:port); falls back to adb's default device.
     #[arg(short, long, global = true)]
     serial: Option<String>,
+
+    /// Wait for the device to answer before running (up to 120s).
+    #[arg(long, global = true)]
+    wait: bool,
 
     /// Subcommand; bare `atvtools` opens the interactive menu.
     #[command(subcommand)]
@@ -160,6 +167,15 @@ enum Cmd {
     Remote {
         /// Scripted key sequence instead of the prompt, e.g. uudr.
         keys: Option<String>,
+        /// Run a macro file instead (key names or shorthand, delay, text, url).
+        #[arg(long, conflicts_with = "keys")]
+        script: Option<PathBuf>,
+        /// Repeat the sequence this many times.
+        #[arg(long, default_value_t = 1, requires = "keys")]
+        repeat: u32,
+        /// Serve a browser D-pad instead (default 0.0.0.0:8080).
+        #[arg(long, num_args = 0..=1, default_missing_value = "0.0.0.0:8080", value_name = "ADDR")]
+        serve: Option<String>,
     },
     /// IPTV playlists (m3u) on the device.
     Iptv {
@@ -172,6 +188,65 @@ enum Cmd {
         /// USB-attached TV into TCP mode on port 5555.
         #[arg(long)]
         fix: bool,
+    },
+    /// Device logs: a bounded logcat dump, or a live stream.
+    Logs {
+        /// Only one logcat tag, e.g. System.out.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Only lines containing this text.
+        #[arg(long)]
+        grep: Option<String>,
+        /// Keep streaming until interrupted (Ctrl-C).
+        #[arg(long)]
+        follow: bool,
+        /// How many lines a dump keeps.
+        #[arg(long, default_value_t = logs::DEFAULT_LINES)]
+        lines: usize,
+    },
+    /// Recent app crashes and ANRs, out of the device dropbox.
+    Crash {
+        /// Only entries containing this text.
+        #[arg(long)]
+        grep: Option<String>,
+        #[arg(long, default_value_t = logs::DEFAULT_LINES)]
+        lines: usize,
+    },
+    /// Full bugreport archive, written by the device into a directory here.
+    Bugreport {
+        #[arg(short, long, default_value = "bugreport")]
+        dir: PathBuf,
+    },
+    /// Enable again the packages the last debloat/preset batch disabled.
+    Undo {
+        /// List the journal instead of restoring anything.
+        #[arg(long)]
+        list: bool,
+        /// A stamp from the list, instead of the newest entry.
+        #[arg(long)]
+        stamp: Option<String>,
+        /// Skip the confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Apply a device profile (.atvtools.toml); --dry-run shows the plan.
+    Apply {
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Print what would change and stop.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Run on every authorized TV.
+        #[arg(long)]
+        all_devices: bool,
+    },
+    /// Several TVs at once.
+    Fleet {
+        #[command(subcommand)]
+        op: FleetOp,
     },
     /// Check for a newer build.
     Update {
@@ -209,14 +284,23 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum TransferOp {
-    /// Send a local file to the TV.
+    /// Send a local file or directory to the TV.
     Push {
         local: PathBuf,
         #[arg(default_value = transfer::DOWNLOADS)]
         remote: String,
+        /// Copy a whole directory tree.
+        #[arg(long)]
+        dir: bool,
     },
-    /// Fetch a file from the TV.
-    Pull { remote: String, local: PathBuf },
+    /// Fetch a file or directory from the TV.
+    Pull {
+        remote: String,
+        local: PathBuf,
+        /// Copy a whole directory tree.
+        #[arg(long)]
+        dir: bool,
+    },
     /// List a device directory.
     Ls {
         #[arg(default_value = transfer::DOWNLOADS)]
@@ -297,7 +381,11 @@ enum DeviceOp {
     /// Open a URL on the device (IPTV list, store page, ...).
     Url { url: String },
     /// Wake the device.
-    Wake,
+    Wake {
+        /// Over the network (wake-on-LAN) instead of a key event.
+        #[arg(long)]
+        lan: bool,
+    },
     /// Send it to sleep.
     Sleep,
     /// Reboot, optionally into recovery or bootloader.
@@ -336,6 +424,9 @@ enum AppsOp {
         /// Only packages installed from the Play Store.
         #[arg(long)]
         play_only: bool,
+        /// Only packages that are disabled (the preset/debloat leftovers).
+        #[arg(long)]
+        disabled: bool,
         /// One JSON object per package.
         #[arg(long)]
         json: bool,
@@ -353,7 +444,12 @@ enum AppsOp {
     /// Uninstall packages for user 0.
     Uninstall { package: Vec<String> },
     /// Disable packages (pm disable-user --user 0).
-    Disable { package: Vec<String> },
+    Disable {
+        package: Vec<String>,
+        /// Run on every authorized TV.
+        #[arg(long)]
+        all_devices: bool,
+    },
     /// Re-enable packages.
     Enable { package: Vec<String> },
     /// Pull the APK(s) of each package into a directory.
@@ -361,6 +457,23 @@ enum AppsOp {
         #[arg(short, long, default_value = "backup")]
         dir: PathBuf,
         package: Vec<String>,
+    },
+    /// Installed version vs the newest catalog release.
+    Outdated,
+    /// Install the newest build of a catalog app.
+    Upgrade { name: String },
+    /// Pull the apk(s) of a package (base + splits) into a directory.
+    Apk {
+        package: String,
+        #[arg(short, long, default_value = "apk")]
+        dir: PathBuf,
+    },
+    /// Biggest packages on the TV (apk size then data size).
+    Size {
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long, value_enum, default_value_t = ScopeArg::ThirdParty)]
+        scope: ScopeArg,
     },
     /// Package name, version and install times.
     Info { package: String },
@@ -465,8 +578,15 @@ enum SettingsOp {
     AdblockOn,
     /// Disable private DNS.
     AdblockOff,
-    /// Print private DNS state.
-    Dns,
+    /// Print private DNS state, or point it at a provider.
+    Dns {
+        /// adguard | cloudflare | nextdns | quad9 | google
+        #[arg(long)]
+        provider: Option<String>,
+        /// NextDNS profile id, used as the hostname label.
+        #[arg(long)]
+        id: Option<String>,
+    },
     /// Set the NTP server.
     Ntp { host: String },
     /// Android TV OTA updates (no flag prints the state).
@@ -485,7 +605,13 @@ enum SettingsOp {
 #[derive(Subcommand, Debug)]
 enum ScreenOp {
     /// Screenshot the device and pull it locally.
-    Shot { file: PathBuf },
+    Shot {
+        #[arg(default_value = "shot.png")]
+        file: PathBuf,
+        /// Shoot every authorized TV into shot-<serial>.png.
+        #[arg(long)]
+        all_devices: bool,
+    },
     /// Record N seconds and pull the video locally.
     Record { seconds: u32, file: PathBuf },
     /// Launch scrcpy (needs scrcpy on PATH, or SCRCPY).
@@ -511,6 +637,28 @@ enum PresetOp {
     },
     /// Re-enable every package of a preset.
     Undo { name: String },
+    /// Write the TV's current state out as a profile file.
+    Export {
+        #[arg(short, long, default_value = ".atvtools.toml")]
+        file: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum FleetOp {
+    /// What every attached TV is: model, Android version, disabled count.
+    Status,
+    /// Apply the profile on every authorized TV.
+    Sync {
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Print what would change and stop.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[cfg(test)]
@@ -562,6 +710,10 @@ fn run_each(adb: &Adb, all: bool, mut f: impl FnMut(&Adb) -> Result<()>) -> Resu
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let adb = Adb::new(cli.serial.clone());
+
+    if cli.wait {
+        wait_for(&adb)?;
+    }
 
     let cmd = cli.cmd.unwrap_or(Cmd::Menu { lang: "en".to_string() });
     match cmd {
@@ -631,8 +783,17 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Apps { op } => match op {
-            AppsOp::List { scope, paths, installer, play_only, json } => {
-                if play_only {
+            AppsOp::List { scope, paths, installer, play_only, disabled, json } => {
+                if disabled {
+                    let scope = scope.as_scope();
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&apps::disabled(&adb, scope)?)?);
+                    } else {
+                        for p in apps::disabled(&adb, scope)? {
+                            println!("{p}");
+                        }
+                    }
+                } else if play_only {
                     for p in apps::play_store_packages(&adb)? {
                         println!("{p}");
                     }
@@ -675,11 +836,50 @@ fn main() -> Result<()> {
                 run_each(&adb, all_devices, |a| apps::install_with(a, &apk, replace))?
             }
             AppsOp::Uninstall { package } => apps::uninstall(&adb, &package)?,
-            AppsOp::Disable { package } => apps::set_enabled(&adb, &package, false)?,
+            AppsOp::Disable { package, all_devices } => run_each(&adb, all_devices, |a| {
+                apps::set_enabled(a, &package, false)?;
+                journals(a, "apps disable", &package);
+                Ok(())
+            })?,
             AppsOp::Enable { package } => apps::set_enabled(&adb, &package, true)?,
             AppsOp::Backup { dir, package } => {
                 for p in apps::backup(&adb, &package, &dir)? {
                     println!("{}", p.display());
+                }
+            }
+            AppsOp::Outdated => {
+                for r in update::catalog_status(&adb)? {
+                    let flag = if r.newer { "-> newer build available" } else { "" };
+                    println!(
+                        "{:<16} {:<28} {:<12} {:<12} {flag}",
+                        r.name,
+                        r.package.unwrap_or_else(|| "-".to_string()),
+                        r.installed.unwrap_or_else(|| "not installed".to_string()),
+                        r.latest.unwrap_or_else(|| "-".to_string()),
+                    );
+                }
+            }
+            AppsOp::Upgrade { name } => {
+                if catalog::find(&name).is_none() {
+                    anyhow::bail!("unknown app '{name}'. known: {}", catalog::names());
+                }
+                let before = catalog::packages(&name)
+                    .iter()
+                    .find_map(|p| apps::installed_version(&adb, p).map(|v| ((*p).to_string(), v)));
+                download::install_catalog_with(&adb, &name, false)?;
+                if let Some((p, was)) = before {
+                    let now = apps::installed_version(&adb, &p).unwrap_or_else(|| "?".to_string());
+                    println!("{p}: {was} -> {now}");
+                }
+            }
+            AppsOp::Apk { package, dir } => {
+                for p in apps::backup(&adb, &[package], &dir)? {
+                    println!("{}", p.display());
+                }
+            }
+            AppsOp::Size { top, scope } => {
+                for (package, apk, data) in apps::sizes(&adb, scope.as_scope(), top)? {
+                    println!("{:>10} {:>10}  {package}", apps::mb(apk), apps::mb(data));
                 }
             }
             AppsOp::Info { package } => print!("{}", apps::info(&adb, &package)?),
@@ -724,7 +924,19 @@ fn main() -> Result<()> {
             SettingsOp::SetFontScale { scale } => settings::set_font_scale(&adb, scale)?,
             SettingsOp::AdblockOn => settings::adblock_on(&adb)?,
             SettingsOp::AdblockOff => settings::adblock_off(&adb)?,
-            SettingsOp::Dns => println!("{}", settings::dns_state(&adb)?),
+            SettingsOp::Dns { provider, id } => match provider {
+                Some(p) => {
+                    let host = settings::dns_host(&p, id.as_deref())?;
+                    settings::set_dns(&adb, &host)?;
+                    println!("{}", settings::dns_state(&adb)?);
+                }
+                None => {
+                    println!("{}", settings::dns_state(&adb)?);
+                    if id.is_some() {
+                        println!("(--id only means something with --provider nextdns)");
+                    }
+                }
+            },
             SettingsOp::Ntp { host } => settings::set_ntp(&adb, &host)?,
             SettingsOp::Ota { off, on } => {
                 if !off && !on {
@@ -739,7 +951,16 @@ fn main() -> Result<()> {
             },
         },
         Cmd::Screen { op } => match op {
-            ScreenOp::Shot { file } => screen::screenshot(&adb, &file)?,
+            ScreenOp::Shot { file, all_devices } => run_each(&adb, all_devices, |a| {
+                let dest = if all_devices {
+                    let serial = a.serial.clone().unwrap_or_default().replace(':', "-");
+                    PathBuf::from(format!("shot-{serial}.png"))
+                } else {
+                    file.clone()
+                };
+                screen::screenshot(a, &dest)?;
+                Ok(())
+            })?,
             ScreenOp::Record { seconds, file } => screen::record(&adb, seconds, &file)?,
             ScreenOp::Scrcpy { extra } => screen::scrcpy(cli.serial.as_deref(), &extra)?,
         },
@@ -777,7 +998,17 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 let pkgs: Vec<String> = p.packages.iter().map(|s| (*s).to_string()).collect();
-                run_each(&adb, all_devices, |a| apps::set_enabled(a, &pkgs, false))?;
+                let what = format!("preset {}", p.title);
+                run_each(&adb, all_devices, |a| {
+                    apps::set_enabled(a, &pkgs, false)?;
+                    journals(a, &what, &pkgs);
+                    Ok(())
+                })?;
+            }
+            PresetOp::Export { file } => {
+                let body = profile::export(&adb)?;
+                std::fs::write(&file, &body)?;
+                println!("wrote {} ({} line(s))", file.display(), body.lines().count());
             }
             PresetOp::Undo { name } => {
                 let p = debloat::find_any(&name)
@@ -804,7 +1035,13 @@ fn main() -> Result<()> {
             DeviceOp::Key { key } => device::key(&adb, &key)?,
             DeviceOp::Text { words } => device::text(&adb, &words)?,
             DeviceOp::Url { url } => device::open_url(&adb, &url)?,
-            DeviceOp::Wake => device::wake(&adb)?,
+            DeviceOp::Wake { lan } => {
+                if lan {
+                    println!("{}", device::wake_lan(&adb)?);
+                } else {
+                    device::wake(&adb)?;
+                }
+            }
             DeviceOp::Sleep => device::sleep(&adb)?,
             DeviceOp::Reboot { mode } => device::reboot(&adb, mode.as_deref())?,
             DeviceOp::Screen { page } => device::screen(&adb, &page)?,
@@ -845,14 +1082,26 @@ fn main() -> Result<()> {
             Ok(())
         })?,
         Cmd::Transfer { op } => match op {
-            TransferOp::Push { local, remote } => transfer::push(&adb, &local, &remote)?,
-            TransferOp::Pull { remote, local } => transfer::pull(&adb, &remote, &local)?,
+            TransferOp::Push { local, remote, dir } => {
+                // adb copies directories recursively on its own; the flag just makes it deliberate.
+                if local.is_dir() && !dir {
+                    anyhow::bail!("{} is a directory; add --dir to send the whole tree", local.display());
+                }
+                transfer::push(&adb, &local, &remote)?;
+            }
+            TransferOp::Pull { remote, local, dir } => {
+                if transfer::is_dir(&adb, &remote) && !dir {
+                    anyhow::bail!("{remote} is a directory; add --dir to fetch the whole tree");
+                }
+                transfer::pull(&adb, &remote, &local)?;
+            }
             TransferOp::Ls { remote } => println!("{}", transfer::ls(&adb, &remote)?),
             TransferOp::Mkdir { remote } => transfer::mkdir(&adb, &remote)?,
         },
-        Cmd::Remote { keys } => match keys {
-            Some(seq) => device::key(&adb, &remote::expand(&seq))?,
-            None => remote::run(&adb)?,
+        Cmd::Remote { keys, script, repeat, serve } => match (serve, keys, script) {
+            (Some(addr), None, None) => remote::serve(&adb, &addr)?,
+            (Some(_), _, _) => anyhow::bail!("--serve cannot be combined with a key sequence or a script"),
+            (None, keys, script) => remote_arm(&adb, keys, script, repeat)?,
         },
         Cmd::Iptv { op } => match op {
             IptvOp::Add { url, name } => println!("{}", iptv::add(&adb, &url, name.as_deref())?),
@@ -873,6 +1122,105 @@ fn main() -> Result<()> {
             }
             print!("{}", doctor::run(&adb)?);
         }
+        Cmd::Logs { tag, grep, follow, lines } => {
+            print!("{}", logs::logcat(&adb, tag.as_deref(), grep.as_deref(), follow, lines)?);
+        }
+        Cmd::Crash { grep, lines } => print!("{}", logs::crash(&adb, grep.as_deref(), lines)?),
+        Cmd::Bugreport { dir } => println!("{}", logs::bugreport(&adb, &dir)?),
+        Cmd::Undo { list, stamp, yes } => {
+            if list {
+                let entries = undo::entries();
+                if entries.is_empty() {
+                    println!("nothing to undo: no journal entries in {}", undo::dir().map(|d| d.display().to_string()).unwrap_or_else(|| "?".to_string()));
+                }
+                for r in entries {
+                    println!("{:<10} {:<24} {:>3} package(s)  {}", r.stamp, r.what, r.packages.len(), r.serial);
+                }
+            } else {
+                let r = undo::last(stamp.as_deref()).ok_or_else(|| {
+                    anyhow::anyhow!("no journal entry to undo; run: atvtools undo --list")
+                })?;
+                println!("{:<10} {:<24} {} package(s)", r.stamp, r.what, r.packages.len());
+                for p in &r.packages {
+                    println!("  {p}");
+                }
+                if !yes && !confirm(&format!("enable those {} packages again?", r.packages.len()))? {
+                    println!("aborted");
+                    return Ok(());
+                }
+                let target = if r.serial.is_empty() { adb.clone() } else { Adb::new(Some(r.serial.clone())) };
+                apps::set_enabled(&target, &r.packages, true)?;
+                match undo::retire(&r.stamp) {
+                    Some(p) => println!("restored; journal entry retired as {}", p.display()),
+                    None => println!("restored"),
+                }
+            }
+        }
+        Cmd::Apply { file, dry_run, yes, all_devices } => {
+            let path = file.unwrap_or_else(profile::default_path);
+            let profile = profile::load(&path)?;
+            let steps = profile::plan(&profile);
+            if steps.is_empty() {
+                println!("{} names nothing to change", path.display());
+                return Ok(());
+            }
+            for s in &steps {
+                println!("{s}");
+            }
+            if dry_run {
+                return Ok(());
+            }
+            if !yes && !confirm(&format!("apply {} change(s) from {}?", steps.len(), path.display()))? {
+                println!("aborted");
+                return Ok(());
+            }
+            // A profile may name its own TV; --serial still wins.
+            let adb = match (cli.serial.is_none(), profile.serial.clone()) {
+                (true, Some(s)) => Adb::new(Some(s)),
+                _ => adb,
+            };
+            run_each(&adb, all_devices, |a| profile::apply(a, &profile))?;
+        }
+        Cmd::Fleet { op } => match op {
+            FleetOp::Status => {
+                let tvs: Vec<Adb> = adb
+                    .devices()?
+                    .into_iter()
+                    .filter(|d| d.state == "device")
+                    .map(|d| Adb::new(Some(d.serial)))
+                    .collect();
+                if tvs.is_empty() {
+                    println!("no authorized TV; run: atvtools devices");
+                }
+                for a in tvs {
+                    let serial = a.serial.clone().unwrap_or_default();
+                    let model = prop_value(&a, "ro.product.model").unwrap_or_else(|| "-".to_string());
+                    let android = prop_value(&a, "ro.build.version.release").unwrap_or_else(|| "-".to_string());
+                    let disabled = apps::disabled(&a, apps::Scope::ThirdParty).map(|d| d.len()).unwrap_or(0);
+                    println!("{serial:<24} {model:<16} android {android:<5} {disabled} disabled");
+                }
+            }
+            FleetOp::Sync { file, dry_run, yes } => {
+                let path = file.unwrap_or_else(profile::default_path);
+                let profile = profile::load(&path)?;
+                let steps = profile::plan(&profile);
+                if steps.is_empty() {
+                    println!("{} names nothing to change", path.display());
+                    return Ok(());
+                }
+                for s in &steps {
+                    println!("{s}");
+                }
+                if dry_run {
+                    return Ok(());
+                }
+                if !yes && !confirm(&format!("apply {} change(s) from {} to every TV?", steps.len(), path.display()))? {
+                    println!("aborted");
+                    return Ok(());
+                }
+                run_each(&adb, true, |a| profile::apply(a, &profile))?;
+            }
+        },
         Cmd::Update { beacon } => print!("{}", update::check(env!("CARGO_PKG_VERSION"), beacon.as_deref())?),
         Cmd::Apk { op } => match op {
             ApkOp::Info { file } => {
@@ -943,6 +1291,7 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 apps::set_enabled(&adb, &pkgs, false)?;
+                journals(&adb, &format!("uad {level}"), &pkgs);
             }
             UadOp::Gui { refresh } => {
                 println!("{}", uad::launch_gui(&adb, refresh)?);
@@ -957,7 +1306,59 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Blocks until the target answers, so a script can start before the TV has
+/// finished booting or before the network handle is up.
+fn wait_for(adb: &Adb) -> Result<()> {
+    const LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+    let deadline = std::time::Instant::now() + LIMIT;
+    loop {
+        let found = adb.devices()?;
+        let ready = match &adb.serial {
+            Some(s) => found.iter().any(|d| d.serial == *s && d.state == "device"),
+            None => found.iter().any(|d| d.state == "device"),
+        };
+        if ready {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            let seen: Vec<String> = found.iter().map(|d| format!("{} ({})", d.serial, d.state)).collect();
+            anyhow::bail!("no authorized device after 120s; adb sees: {}", if seen.is_empty() { "nothing".to_string() } else { seen.join(", ") });
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Files a batch in the undo journal. A journal that cannot be written is
+/// reported but never undoes a disable that already happened.
+fn journals(adb: &Adb, what: &str, packages: &[String]) {
+    match undo::note(what, adb.serial.as_deref(), packages) {
+        Ok(p) => println!("journal: {} (atvtools undo puts these back)", p.display()),
+        Err(e) => println!("journal: not written ({e})"),
+    }
+}
+
 /// Connects, remembers the address and reports what answered.
+/// The three ways to drive the remote: a key sequence, a macro file, or the prompt.
+fn remote_arm(adb: &Adb, keys: Option<String>, script: Option<PathBuf>, repeat: u32) -> Result<()> {
+    match (keys, script) {
+        (Some(seq), _) => {
+            let names = remote::expand(&seq);
+            for _ in 0..repeat.max(1) {
+                device::key(adb, &names)?;
+            }
+            println!(
+                "sent {} key(s){}{}",
+                names.len(),
+                if repeat > 1 { format!(" x{repeat}") } else { String::new() },
+                if names.is_empty() { " (nothing matched)" } else { "" }
+            );
+        }
+        (None, Some(path)) => println!("{}", remote::script(adb, &path)?),
+        (None, None) => remote::run(adb)?,
+    }
+    Ok(())
+}
+
 pub fn connect_to(adb: &Adb, host: &str) -> Result<String> {
     let target = net::normalize_target(host, net::ADB_PORT);
     let out = adb.connect(&target)?.trim().to_string();

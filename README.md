@@ -11,7 +11,7 @@ talks to `adb` directly on macOS, Linux and Windows.
 
 ```sh
 cargo build --release      # target/release/atvtools (CLI + GUI)
-cargo test                 # unit tests (45)
+cargo test                 # unit tests (88)
 ```
 
 Requirements: `adb` on PATH, or `ADB=/path/to/adb`. `curl` is used for
@@ -63,7 +63,39 @@ atvtools uad apply --level recommended --yes   # disable all of them at once
 atvtools uad info com.google.android.youtube  # what the database says about one package
 atvtools uad refresh             # re-download the database into ~/.atvtools
 atvtools uad gui                 # run the upstream UAD window (downloaded once to ~/.atvtools/uad)
+
+# new in this batch: what changed, what is out of date, and undoing a debloat
+atvtools -s 192.168.1.50:5555 apps size --top 20     # biggest packages, apk + data
+atvtools -s 192.168.1.50:5555 apps outdated          # installed version vs the catalog
+atvtools -s 192.168.1.50:5555 apps upgrade smarttube # download and install the newer build
+atvtools -s 192.168.1.50:5555 apps apk com.example.app --dir ./apk   # pull an installed APK
+atvtools -s 192.168.1.50:5555 apps list --disabled   # only the packages that are turned off
+atvtools -s 192.168.1.50:5555 undo                   # re-enable the last disabled batch
+atvtools -s 192.168.1.50:5555 undo --list            # every batch still in the journal
+atvtools -s 192.168.1.50:5555 logs --lines 200 --grep wifi
+atvtools -s 192.168.1.50:5555 logs --follow          # live stream, ctrl-c to stop
+atvtools -s 192.168.1.50:5555 crash                  # recent crashes/ANRs out of the dropbox
+atvtools -s 192.168.1.50:5555 bugreport --dir ./br   # the device writes the archive
+atvtools -s 192.168.1.50:5555 device wake --lan      # Wake-on-LAN magic packet to the TV MAC
+atvtools -s 192.168.1.50:5555 remote --script macros/start.txt   # keys, delay, text, url
+atvtools -s 192.168.1.50:5555 remote uu --repeat 3   # the same sequence three times
+atvtools -s 192.168.1.50:5555 remote --serve         # browser D-pad for the phone (0.0.0.0:8080)
+atvtools -s 192.168.1.50:5555 settings dns cloudflare     # or nextdns --id <profile>
+atvtools -s 192.168.1.50:5555 apply -f tv.atvtools.toml --dry-run
+atvtools preset export -f tv.atvtools.toml           # dump this TV into a profile
+atvtools fleet status                                # every attached TV at a glance
+atvtools fleet sync -f tv.atvtools.toml --yes        # the same profile on all of them
+atvtools -s 192.168.1.50:5555 screen shot            # shot.png; --all-devices writes shot-<serial>.png
+atvtools -s 192.168.1.50:5555 transfer push ./movies --dir   # a whole tree
+atvtools --wait -s 192.168.1.50:5555 install smarttube       # wait for the TV to answer first
 ```
+
+A profile is a small TOML file (`.atvtools.toml`): an optional `[device] serial`,
+`[settings]` density / font scale / private DNS / screen-off timeout, and
+`[apps] install`, `disable`, `enable` lists. `apply` prints the plan first and
+asks before changing anything; `preset export` writes the file from the TV you
+are connected to. Every disable also lands in `~/.atvtools/undo`, so `undo` can
+put it back.
 
 ## GUI
 
@@ -72,18 +104,19 @@ an [egui](https://github.com/emilk/egui) window with the same reach as the CLI:
 
 | Tab | What is there |
 |---|---|
-| Connect | type or scan for the TV, connect, list attached devices |
+| Connect | type or scan for the TV, connect, list attached devices; each attached TV has a `use` button that retargets the whole window |
 | Apps | scope filter, package table, tick rows, then disable / enable / uninstall / launch / force stop / info |
 | Files | type a folder on the TV and a path on this machine, then list / send / copy from / make folder |
 | Debloat | pick a scope and a UAD removal level, scan, tick, disable or re-enable |
 | Settings | density, font scale, AdGuard DNS, OTA blocking, the on/off toggles, settings-screen shortcuts |
-| Screen | screenshot, timed screen recording, scrcpy |
+| Screen | screenshot (shown inline in the window), timed screen recording, scrcpy |
 | Remote | every keycode as a button, plus text, URL, wake/sleep/reboot and the notification shade |
 | Helpers | doctor, doctor --fix, device info, optimize, update check, `uad gui`, catalog installs (each row's `replace` button removes the other build of the same id first, e.g. official Shizuku → fork) |
 
 Everything the GUI runs it runs through the same modules as the CLI, so a button
 and its subcommand behave identically. The activity pane at the bottom keeps the
-last 400 lines of what was executed.
+last 400 lines of what was executed; everything it prints is also appended to
+~/.atvtools/log, which rotates to log.1 once it passes 1 MB.
 
 ## Original menu → this CLI
 
@@ -151,10 +184,12 @@ last 400 lines of what was executed.
 - Tests cover device-list parsing, `pm path` split parsing, density-line
   parsing, package-list de-duplication, catalog and preset lookups, permission
   scans, keycode/shorthand expansion, m3u name sanitising, APK manifest/resource
-  parsing (with hand-built AXML, arsc and zip fixtures),
-  adb version detection, beacon parsing, the Google install order and the UAD
-  database levels/sorting. The GUI is not unit-tested: it is a thin shell over the
-  same functions the tests cover, so it is exercised by running it.
+  parsing (with hand-built AXML, arsc and zip fixtures), diskstats size rows,
+  the undo journal, the profile parser, macro scripts, the PNG reader behind the
+  GUI screenshot preview, adb version detection, beacon parsing, version
+  comparison against release tags, the Google install order and the UAD
+  database levels/sorting. The GUI itself is not unit-tested: it is a thin shell
+  over the same functions the tests cover, so it is exercised by running it.
 
 ## Feature parity with the original Windows tool
 
@@ -217,15 +252,19 @@ the user; **no** = not ported.
 | Country list helper | yes | `doctor` prints the egress country |
 | Windows ADB driver install | partial | `doctor` reports the adb version and the platform-tools hint; it does not install drivers |
 | Launch installed user apps | yes | `apps launch <pkg>` |
-| Wake / sleep the TV | yes | `device wake`, `device sleep` |
+| Wake / sleep the TV | yes | `device wake`, `device sleep`, `device wake --lan` (Wake-on-LAN) |
 | Check for TV updates | partial | `settings ota [--off\|--on]` blocks/allows OTA; firmware checks stay per-OEM |
 | Open the notification shade | yes | `device notifications` |
 | Device info (serial, build, Android version, resolution, battery) | yes | `info` |
 | History of connected TVs | yes | `history` (also appended on `connect`) |
+| (new) Device logs, crashes and bugreports on the PC | yes | `logs [--grep --follow]`, `crash`, `bugreport` |
+| (new) Which packages are out of date | yes | `apps outdated`, `apps upgrade <name>` |
+| (new) The same setup on several TVs | yes | `fleet status`, `fleet sync -f tv.atvtools.toml`, `preset export`, `apply --dry-run` |
+| (new) Browser D-pad for the phone | yes | `remote --serve` |
 | Suggest the TV IP | yes | `mdns` (adb mDNS discovery), `doctor` |
 | Launcher shortcut icons for hidden apps | partial | `apps shortcuts` prints label + Play Store URL pairs (what the original's helper site consumed) |
 
-**Counted:** 53 yes, 7 partial, 0 no of 60 listed items — roughly 88% of the listed
+**Counted:** 57 yes, 7 partial, 0 no of 64 listed items — roughly 88% of the listed
 feature surface works with a single command; the partial ones are one manual step away.
 
 The GUI adds no row: every tab is listed above as its CLI equivalent.

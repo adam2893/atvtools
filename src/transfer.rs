@@ -31,6 +31,12 @@ pub fn mkdir(adb: &Adb, remote: &str) -> Result<()> {
     Ok(())
 }
 
+/// True when the device path is a directory (used to make --dir a deliberate choice).
+pub fn is_dir(adb: &Adb, remote: &str) -> bool {
+    adb.try_out(&["shell", &format!("[ -d {remote} ] && echo yes")])
+        .contains("yes")
+}
+
 /// Long listing of a device directory, sizes in bytes.
 pub fn ls(adb: &Adb, remote: &str) -> Result<String> {
     Ok(adb.shell(&format!("ls -l {remote}"))?)

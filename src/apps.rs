@@ -145,6 +145,85 @@ pub fn parse_pm_path(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// versionName of one installed package, from a single dumpsys pass.
+pub fn installed_version(adb: &Adb, package: &str) -> Option<String> {
+    parse_version_name(&adb.try_out(&["shell", &format!("dumpsys package {package}")]))
+}
+
+pub fn parse_version_name(raw: &str) -> Option<String> {
+    raw.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("versionName="))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v != "null")
+}
+
+/// Packages currently disabled for user 0 (pm list packages -d).
+pub fn disabled(adb: &Adb, scope: Scope) -> Result<Vec<String>> {
+    let flag = match scope {
+        Scope::ThirdParty => " -3",
+        Scope::System => " -s",
+        Scope::All => "",
+    };
+    Ok(parse_package_list(&adb.shell(&format!("pm list packages -d{flag}"))?))
+}
+
+/// Per-package storage from one dumpsys diskstats pass: (package, apk bytes, data bytes).
+/// The arrays diskstats prints are index-aligned; when an OEM build prints a
+/// different shape the counts disagree and that is reported instead of guessed.
+pub fn parse_sizes(raw: &str) -> Result<Vec<(String, u64, u64)>> {
+    let names = diskstats_array(raw, "Package Names:").unwrap_or_default();
+    let apk = diskstats_array(raw, "App Sizes:").unwrap_or_default();
+    let data = diskstats_array(raw, "App Data Sizes:").unwrap_or_default();
+    if names.is_empty() || apk.is_empty() {
+        bail!("this build dumpsys diskstats has no package size arrays");
+    }
+    if names.len() != apk.len() || names.len() != data.len() {
+        bail!(
+            "diskstats lists {} packages but {} apk / {} data sizes, so the rows cannot be lined up on this build",
+            names.len(),
+            apk.len(),
+            data.len()
+        );
+    }
+    let apk: Vec<u64> = apk.iter().map(|s| s.parse().unwrap_or(0)).collect();
+    let data: Vec<u64> = data.iter().map(|s| s.parse().unwrap_or(0)).collect();
+    Ok(names.into_iter().zip(apk).zip(data).map(|((n, a), d)| (n, a, d)).collect())
+}
+
+/// The biggest packages on the device, biggest first, limited to one scope.
+pub fn sizes(adb: &Adb, scope: Scope, top: usize) -> Result<Vec<(String, u64, u64)>> {
+    let installed = list(adb, scope)?;
+    let raw = adb.try_out(&["shell", "dumpsys diskstats"]);
+    let mut rows: Vec<(String, u64, u64)> = parse_sizes(&raw)?
+        .into_iter()
+        .filter(|(p, _, _)| installed.iter().any(|i| i == p))
+        .collect();
+    rows.sort_by_key(|(_, apk, data)| std::cmp::Reverse(apk + data));
+    rows.truncate(top);
+    Ok(rows)
+}
+
+/// Bytes as the largest unit that keeps one decimal (MB, GB).
+pub fn mb(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= 1024.0 * MB {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * MB))
+    } else {
+        format!("{:.1} MB", bytes as f64 / MB)
+    }
+}
+
+/// Reads one bracketed comma-separated array out of dumpsys output
+/// ("App Sizes: [1,2,3]"); quotes are stripped.
+fn diskstats_array(raw: &str, key: &str) -> Option<Vec<String>> {
+    let start = raw.find(key)? + key.len();
+    let body = &raw[start..];
+    let body = &body[body.find('[')? + 1..];
+    let end = body.find(']').unwrap_or(body.len());
+    Some(body[..end].split(',').map(|s| s.trim().trim_matches('"').to_string()).collect())
+}
+
 /// A package row from pm list packages -3 -f -i.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PkgRow {
@@ -424,6 +503,37 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert!(p[0].ends_with("base.apk"));
         assert!(p[1].ends_with("split_config.arm64.apk"));
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    const DISKSTATS: &str = "App Size: 2270913024\nApp Data Size: 634474240\nPackage Names: [\"com.a\",\"com.b\",\"com.c\"]\nApp Sizes: [1048576,0,3145728]\nApp Data Sizes: [2048,4096,0]\nCache Sizes: [0,0,0]\n";
+
+    #[test]
+    fn sizes_line_up_with_the_package_names() {
+        let rows = parse_sizes(DISKSTATS).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].0, "com.c");
+        assert_eq!(rows[2].1, 3145728);
+        assert_eq!(mb(3145728), "3.0 MB");
+        assert_eq!(mb(3221225472), "3.0 GB");
+    }
+
+    #[test]
+    fn a_mismatched_array_is_reported_not_guessed() {
+        let raw = "Package Names: [\"com.a\",\"com.b\"]\nApp Sizes: [1]\nApp Data Sizes: [1,2]\n";
+        let e = parse_sizes(raw).unwrap_err().to_string();
+        assert!(e.contains("2 packages but 1 apk"), "{e}");
+    }
+
+    #[test]
+    fn a_version_name_is_read_out_of_a_dumpsys_dump() {
+        let raw = "Packages:\n  Package [com.a] (abc):\n    versionCode=12 minSdk=21\n    versionName=1.2.3\n";
+        assert_eq!(parse_version_name(raw).as_deref(), Some("1.2.3"));
+        assert_eq!(parse_version_name("versionName=null"), None);
     }
 }
 

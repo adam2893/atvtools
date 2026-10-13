@@ -44,7 +44,20 @@ pub fn is_newer(current: &str, remote: &str) -> bool {
     if c == r {
         return false;
     }
-    let nums = |s: &str| -> Vec<u32> { s.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    // "32.56s" -> [32, 56]: some projects suffix their tags (SmartTube), the
+    // digits are what identifies the build.
+    let nums = |s: &str| -> Vec<u32> {
+        s.split('.')
+            .map(|p| {
+                let digits: String = p
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse().unwrap_or(0)
+            })
+            .collect()
+    };
     let (cv, rv) = (nums(&c), nums(&r));
     for i in 0..cv.len().max(rv.len()) {
         let (a, b) = (cv.get(i).copied().unwrap_or(0), rv.get(i).copied().unwrap_or(0));
@@ -95,6 +108,38 @@ pub fn check(current: &str, beacon: Option<&str>) -> Result<String> {
     Ok(out)
 }
 
+/// One catalog entry as it stands on the TV.
+pub struct Row {
+    pub name: String,
+    pub package: Option<String>,
+    pub installed: Option<String>,
+    pub latest: Option<String>,
+    pub newer: bool,
+}
+
+/// Catalog apps vs what the TV runs: the installed version comes from one
+/// dumpsys per package that is actually there, the newest from the release
+/// feed. An entry with no package id, or a feed that cannot be read, is left
+/// unknown rather than reported as up to date.
+pub fn catalog_status(adb: &crate::adb::Adb) -> Result<Vec<Row>> {
+    let installed = crate::apps::list(adb, crate::apps::Scope::ThirdParty)?;
+    let mut rows = Vec::new();
+    for entry in crate::catalog::CATALOG {
+        let package = crate::catalog::packages(entry.name)
+            .iter()
+            .find(|p| installed.iter().any(|i| i == *p))
+            .map(|p| (*p).to_string());
+        let version = package.as_ref().and_then(|p| crate::apps::installed_version(adb, p));
+        let latest = crate::catalog::latest_tag(entry.url).ok().flatten();
+        let newer = match (&version, &latest) {
+            (Some(v), Some(l)) => is_newer(v, l),
+            _ => false,
+        };
+        rows.push(Row { name: entry.name.to_string(), package, installed: version, latest, newer });
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +158,13 @@ mod tests {
         assert_eq!(b.url, "https://x/v5.zip");
         assert_eq!(b.changelog, "https://x/thread");
         assert!(parse_beacon("").is_none());
+    }
+
+    #[test]
+    fn a_suffix_letter_does_not_hide_the_build_number() {
+        assert!(is_newer("32.55", "32.56s"));
+        assert!(!is_newer("32.56s", "32.56"));
+        assert!(is_newer("1.23.2", "1.24"));
     }
 
     #[test]

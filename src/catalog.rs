@@ -29,6 +29,47 @@ pub const CATALOG: &[Entry] = &[
     Entry { name: "ftvlaunchx", url: "https://github.com/codefaktor/FTVLaunchX/releases/download/v1.0.1/FTVLaunchX-1.0.1.apk", note: "FTVLaunchX" },
 ];
 
+/// Installed package ids a catalog entry can appear as, newest id first: most
+/// of these apps changed their id at some point (SmartTube moved from
+/// com.liskovsoft.smarttubetv to org.smarttube.stable), so an old install is
+/// still recognised as the same app.
+pub const PACKAGES: &[(&str, &[&str])] = &[
+    ("smarttube", &["org.smarttube.stable", "com.liskovsoft.smarttubetv"]),
+    ("smarttube-beta", &["org.smarttube.beta", "com.liskovsoft.smarttubetv.beta"]),
+    ("aurora", &["com.aurora.store"]),
+    ("aptoide", &["cm.aptoidetv.pt", "cm.aptoide.partners"]),
+    ("flauncher", &["de.cyberflohr.flauncher", "com.example.flauncher"]),
+    ("projectivy", &["com.spocky.projengmenu"]),
+    ("adguard-tv", &["com.adguard.androidtv"]),
+    ("launch-on-boot", &["news.androidtv.launchonboot"]),
+    ("shizuku-fork", &["moe.shizuku.privileged.api"]),
+    ("nuvio", &["com.nuvio.app"]),
+    ("nuvio-x86", &["com.nuvio.app"]),
+    ("ftvlaunchx", &["com.codefaktor.ftvlaunchx"]),
+];
+
+pub fn packages(name: &str) -> &'static [&'static str] {
+    PACKAGES.iter().find(|(n, _)| *n == name).map(|(_, p)| *p).unwrap_or(&[])
+}
+
+/// The newest release tag a catalog entry points at, for the "is my TV behind?"
+/// check. A pinned url carries its version in the path (…/releases/download/1.0.0/x.apk);
+/// None means the entry cannot be compared (GitLab upload, shortener, aptoide pool).
+pub fn latest_tag(url: &str) -> Result<Option<String>> {
+    if let Some(spec) = url.strip_prefix("gh:") {
+        let (repo, kind) = spec.split_once(':').unwrap_or((spec, "stable"));
+        let json = crate::download::fetch_text(&format!("{GITHUB_API}/{repo}/releases?per_page=15"))?;
+        let rels = parse_releases(&json)?;
+        let rel = pick_release(&rels, kind == "beta")
+            .ok_or_else(|| anyhow!("{repo} has no {kind} release with downloadable files"))?;
+        return Ok(Some(rel.tag.clone()));
+    }
+    Ok(url
+        .split_once("/releases/download/")
+        .and_then(|(_, rest)| rest.split('/').next())
+        .map(str::to_string))
+}
+
 pub fn find(name: &str) -> Option<&'static Entry> {
     let want = name.trim().to_ascii_lowercase();
     CATALOG.iter().find(|e| e.name == want)
@@ -200,6 +241,22 @@ mod tests {
         let beta = pick_release(&rels, true).unwrap();
         assert_eq!(beta.tag, "32.56");
         assert_eq!(pick_asset(beta, &["x86_64", "x86"]), Some("https://x/beta-x86.apk"));
+    }
+
+    #[test]
+    fn a_pinned_release_url_tells_us_its_version() {
+        let url = "https://github.com/NuvioMedia/NuvioTV/releases/download/1.0.0/app-full-arm64-v8a-release.apk";
+        assert_eq!(latest_tag(url).unwrap().as_deref(), Some("1.0.0"));
+        assert_eq!(latest_tag("https://agrd.io/tvapk").unwrap(), None);
+    }
+
+    #[test]
+    fn catalog_entries_know_their_package_ids() {
+        assert_eq!(packages("smarttube"), &["org.smarttube.stable", "com.liskovsoft.smarttubetv"][..]);
+        assert!(packages("nope").is_empty());
+        for e in CATALOG {
+            assert!(!packages(e.name).is_empty(), "{} has no package id", e.name);
+        }
     }
 
     #[test]

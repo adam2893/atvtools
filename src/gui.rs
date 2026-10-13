@@ -26,15 +26,21 @@ enum Tab {
     Helpers,
 }
 
-/// Every activity line also lands in ~/.atvtools/log.
-// shortcut: the file grows without rotation; trim it if a long-running install session matters.
+/// Every activity line also lands in ~/.atvtools/log, one rotation deep: once the
+/// file passes MAX_LOG_BYTES it is renamed to log.1 and started fresh.
+const MAX_LOG_BYTES: u64 = 1_000_000;
+
 fn append_log(line: &str) {
     use std::io::Write as _;
     let Some(dir) = uad::home_dir().map(|h| h.join(".atvtools")) else { return };
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log")) else {
+    let path = dir.join("log");
+    if std::fs::metadata(&path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
+        let _ = std::fs::rename(&path, dir.join("log.1"));
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
     let _ = writeln!(file, "{line}");
@@ -76,6 +82,10 @@ struct App {
     seconds: String,
     remote_path: String,
     local_path: String,
+    /// Attached devices, refreshed by the Connect tab; picking one retargets the app.
+    attached: Vec<crate::adb::Device>,
+    /// Decoded screenshot, shown inline under the Screen tab.
+    shot: Option<egui::TextureHandle>,
 }
 
 impl App {
@@ -101,6 +111,8 @@ impl App {
             seconds: "20".to_string(),
             remote_path: transfer::DOWNLOADS.to_string(),
             local_path: String::new(),
+            attached: Vec::new(),
+            shot: None,
         };
         app.say("atvtools GUI. Connect to a TV on the first tab, then pick a tab above.");
         app
@@ -179,13 +191,13 @@ impl App {
                 self.found = answers;
             }
             if ui.button("list devices").clicked() {
-                self.act("devices", |adb| {
-                    let d = adb.devices()?;
-                    Ok(d.iter()
-                        .map(|x| format!("{} {}", x.serial, x.state))
-                        .collect::<Vec<_>>()
-                        .join(", "))
-                });
+                match self.adb.devices() {
+                    Ok(d) => {
+                        self.say(format!("{} device(s) attached", d.len()));
+                        self.attached = d;
+                    }
+                    Err(e) => self.say(format!("devices: {e}")),
+                }
             }
         });
         let mut pick: Option<String> = None;
@@ -196,6 +208,20 @@ impl App {
                     pick = Some(host.clone());
                 }
             });
+        }
+        let mut use_this: Option<String> = None;
+        for d in &self.attached {
+            ui.horizontal(|ui| {
+                ui.monospace(format!("{:<24} {:<16} {}", d.serial, d.model.as_deref().unwrap_or("-"), d.state));
+                if ui.small_button("use").clicked() {
+                    use_this = Some(d.serial.clone());
+                }
+            });
+        }
+        if let Some(serial) = use_this {
+            self.serial_input = serial.clone();
+            self.adb = Adb::new(Some(serial.clone()));
+            self.say(format!("target set to {serial}"));
         }
         if let Some(host) = pick {
             let res = crate::connect_to(&self.adb, &host);
@@ -519,10 +545,11 @@ impl App {
             if ui.button("screenshot").clicked() {
                 let dest = std::env::temp_dir().join(SHOT);
                 let path = dest.display().to_string();
-                self.act("screenshot", move |adb| {
-                    screen::screenshot(adb, std::path::Path::new(&path))
-                        .map(|_| format!("saved {path}"))
-                });
+                match screen::screenshot(&self.adb, &dest) {
+                    Ok(()) => self.say(format!("screenshot: saved {path}")),
+                    Err(e) => self.say(format!("screenshot: {e}")),
+                }
+                self.preview(&dest, ui.ctx());
             }
             ui.label("record seconds");
             ui.add(egui::TextEdit::singleline(&mut self.seconds).desired_width(60.0));
@@ -546,8 +573,25 @@ impl App {
                 }
             }
         });
+        if let Some(tex) = &self.shot {
+            ui.add(egui::Image::new(egui::load::SizedTexture::from_handle(tex)).max_width(420.0));
+        }
         ui.separator();
         ui.label("scrcpy mirrors the TV on this machine; it is an external binary (SCRCPY env var or PATH).");
+    }
+
+    /// Decode the file we just pulled and put it on screen; the reader only
+    /// handles the shapes screencap emits, so an odd PNG just gets a note.
+    fn preview(&mut self, path: &std::path::Path, ctx: &egui::Context) {
+        self.shot = None;
+        let Ok(bytes) = std::fs::read(path) else { return };
+        match png_rgba(&bytes) {
+            Some((w, h, rgba)) => {
+                let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                self.shot = Some(ctx.load_texture("shot", image, egui::TextureOptions::LINEAR));
+            }
+            None => self.say("preview: nothing to draw; open the file instead"),
+        }
     }
 
     fn remote_tab(&mut self, ui: &mut egui::Ui) {
@@ -708,5 +752,142 @@ impl eframe::App for App {
             Tab::Remote => self.remote_tab(ui),
             Tab::Helpers => self.helpers_tab(ui),
         });
+    }
+}
+
+/// Minimal PNG reader for the screenshots we pull: 8-bit RGB or RGBA, not
+/// interlaced. Decoding here keeps an image crate out of the build.
+fn png_rgba(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if !bytes.starts_with(&SIG) {
+        return None;
+    }
+    let (mut w, mut h, mut channels) = (0usize, 0usize, 0usize);
+    let mut idat: Vec<u8> = Vec::new();
+    let mut at = 8;
+    while at + 8 <= bytes.len() {
+        let len = be32(bytes, at)? as usize;
+        let kind = bytes.get(at + 4..at + 8)?;
+        let body = bytes.get(at + 8..at + 8 + len)?;
+        match kind {
+            b"IHDR" => {
+                w = be32(body, 0)? as usize;
+                h = be32(body, 4)? as usize;
+                if body.get(8).copied() != Some(8) {
+                    return None; // palette or 16-bit: not what screencap writes
+                }
+                channels = match body.get(9).copied()? {
+                    2 => 3,
+                    6 => 4,
+                    _ => return None,
+                };
+                if body.get(12).copied() != Some(0) {
+                    return None; // interlaced
+                }
+            }
+            b"IDAT" => idat.extend_from_slice(body),
+            b"IEND" => break,
+            _ => {}
+        }
+        at += 12 + len; // length, kind, body, crc
+    }
+    if w == 0 || h == 0 {
+        return None;
+    }
+    // IDAT is zlib-framed deflate; the raw variant is what the zip reader needs.
+    let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&idat).ok()?;
+    let stride = w * channels;
+    let mut out = vec![0u8; w * h * 4];
+    let mut prev = vec![0u8; stride];
+    for y in 0..h {
+        let row = raw.get(y * (stride + 1)..(y + 1) * (stride + 1))?;
+        let filter = row[0];
+        let mut cur = row[1..].to_vec();
+        for i in 0..stride {
+            let a = if i >= channels { cur[i - channels] } else { 0 };
+            let b = prev[i];
+            let c = if i >= channels { prev[i - channels] } else { 0 };
+            let left = a as u16;
+            let up = b as u16;
+            cur[i] = match filter {
+                0 => cur[i],
+                1 => cur[i].wrapping_add(a),
+                2 => cur[i].wrapping_add(b),
+                3 => cur[i].wrapping_add(((left + up) / 2) as u8),
+                4 => cur[i].wrapping_add(paeth(a, b, c)),
+                _ => return None,
+            };
+        }
+        for x in 0..w {
+            let (r, g, bl, al) = match channels {
+                3 => (cur[x * 3], cur[x * 3 + 1], cur[x * 3 + 2], 255),
+                _ => (cur[x * 4], cur[x * 4 + 1], cur[x * 4 + 2], cur[x * 4 + 3]),
+            };
+            let o = (y * w + x) * 4;
+            out[o] = r;
+            out[o + 1] = g;
+            out[o + 2] = bl;
+            out[o + 3] = al;
+        }
+        prev = cur;
+    }
+    Some((w, h, out))
+}
+
+fn be32(d: &[u8], at: usize) -> Option<u32> {
+    let b = d.get(at..at + 4)?;
+    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+    let pa = (b as i16 - c as i16).abs();
+    let pb = (a as i16 - c as i16).abs();
+    let pc = (a as i16 + b as i16 - 2 * c as i16).abs();
+    if pa <= pb && pa <= pc {
+        a
+    } else if pb <= pc {
+        b
+    } else {
+        c
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut c = (body.len() as u32).to_be_bytes().to_vec();
+        c.extend_from_slice(kind);
+        c.extend_from_slice(body);
+        c.extend_from_slice(&[0, 0, 0, 0]); // the reader ignores CRCs
+        c
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let mut ihdr = 2u32.to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA, no interlace
+        let raw = vec![0u8, 255, 0, 0, 255, 0, 255, 0, 255]; // filter byte + 2 pixels
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend(chunk(b"IHDR", &ihdr));
+        png.extend(chunk(b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6)));
+        png.extend(chunk(b"IEND", &[]));
+        png
+    }
+
+    #[test]
+    fn a_screencap_shaped_png_decodes() {
+        let (w, h, rgba) = png_rgba(&tiny_png()).unwrap();
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(rgba, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert!(png_rgba(b"not a png").is_none());
+    }
+
+    #[test]
+    fn the_paeth_predictor_matches_the_spec() {
+        assert_eq!(paeth(0, 0, 0), 0);
+        // a=10, b=20, c=15: pa=5, pb=5, pc=0, and the tie goes to c.
+        assert_eq!(paeth(10, 20, 15), 15);
     }
 }

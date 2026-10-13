@@ -4,6 +4,7 @@
 //! neighbour table (the script used `arp -a`) probed with `adb connect`.
 
 use crate::adb::Adb;
+use anyhow::Result;
 use std::net::{SocketAddr, TcpStream};
 use std::process::Command;
 use std::time::Duration;
@@ -28,6 +29,47 @@ fn split_host(entry: &str) -> (String, u16) {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(ADB_PORT)),
         None => (entry.to_string(), ADB_PORT),
     }
+}
+
+/// A MAC address out of `ip link` output or /sys/class/net/<if>/address.
+pub fn mac_from(text: &str) -> Option<String> {
+    for token in text.split_whitespace() {
+        let t = token.trim_matches(|c: char| !c.is_ascii_hexdigit() && c != ':');
+        if is_mac(t) {
+            return Some(t.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn is_mac(t: &str) -> bool {
+    let parts: Vec<&str> = t.split(':').collect();
+    parts.len() == 6
+        && parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+        && !parts.iter().all(|p| *p == "00")
+}
+
+/// 6 x 0xff then the MAC 16 times: the wake-on-LAN magic packet.
+pub fn magic_packet(mac: &str) -> Option<Vec<u8>> {
+    let mac = mac_from(mac)?;
+    let bytes: Vec<u8> = mac.split(':').filter_map(|p| u8::from_str_radix(p, 16).ok()).collect();
+    let mut out = vec![0xffu8; 6];
+    for _ in 0..16 {
+        out.extend_from_slice(&bytes);
+    }
+    Some(out)
+}
+
+/// Broadcasts the packet on the local network. UDP gives no delivery report, so
+/// it goes out three times; there is nothing to read back either way.
+pub fn wake_on_lan(mac: &str) -> Result<()> {
+    let packet = magic_packet(mac).ok_or_else(|| anyhow::anyhow!("'{mac}' is not a MAC address"))?;
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_broadcast(true)?;
+    for _ in 0..3 {
+        socket.send_to(&packet, ("255.255.255.255", 9))?;
+    }
+    Ok(())
 }
 
 /// "192.168.1.50" or "192.168.1.50:5555" -> "192.168.1.50:5555".
@@ -172,6 +214,23 @@ pub fn probe(adb: &Adb, hosts: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_mac_is_read_out_of_ip_link_output() {
+        let text = "2: wlan0: <BROADCAST> mtu 1500\n    link/ether 3c:cd:5d:11:22:33 brd ff:ff:ff:ff:ff:ff";
+        assert_eq!(super::mac_from(text).unwrap(), "3c:cd:5d:11:22:33");
+        assert_eq!(super::mac_from("aa:bb\n").is_none(), true);
+        assert!(super::mac_from("00:00:00:00:00:00").is_none());
+    }
+
+    #[test]
+    fn the_magic_packet_repeats_the_mac_sixteen_times() {
+        let p = super::magic_packet("3c:cd:5d:11:22:33").unwrap();
+        assert_eq!(p.len(), 102);
+        assert_eq!(&p[..6], &[0xff; 6]);
+        assert_eq!(&p[6..12], &[0x3c, 0xcd, 0x5d, 0x11, 0x22, 0x33]);
+        assert!(super::magic_packet("nope").is_none());
+    }
+
     use super::*;
 
     #[test]
