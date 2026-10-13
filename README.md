@@ -7,12 +7,23 @@ script, shells out to `adb`, downloads APKs and drives `cmd.exe` for its UI.
 This port keeps the behaviour and drops the Windows dependency: one binary that
 talks to `adb` directly on macOS, Linux and Windows.
 
+## Download
+
+Prebuilt binaries are on the [releases page](https://github.com/adam2893/atvtools/releases):
+macOS (one universal binary, Intel and Apple silicon), Linux x86-64 and Windows x86-64.
+Unpack it and put `atvtools` somewhere on your PATH — it is the CLI and the GUI in one file.
+
 ## Build
 
 ```sh
 cargo build --release      # target/release/atvtools (CLI + GUI)
 cargo test                 # unit tests (88)
 ```
+
+Tagging (`git tag v4.1.0 && git push --tags`) or running the *release* workflow by hand
+builds all three platforms on GitHub runners and attaches the archives to a new release
+(`.github/workflows/release.yml`). The tag names the build: the workflow writes it into
+`Cargo.toml` before compiling, so `atvtools --version` matches the release.
 
 Requirements: `adb` on PATH, or `ADB=/path/to/adb`. `curl` is used for
 downloads (`scrcpy` for mirroring) and both are optional; `SCRCPY` overrides

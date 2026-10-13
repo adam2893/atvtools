@@ -1,6 +1,6 @@
 [package]
 name = "atvtools"
-version = "4.0.0"
+version = "4.1.0"
 edition = "2021"
 description = "Cross-platform Android TV / Google TV toolbox (Rust port of Android TV Tools v4.0)"
 license = "MIT"

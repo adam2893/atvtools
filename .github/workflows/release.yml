@@ -1,0 +1,112 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'tag to create, e.g. v4.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            asset: macos-universal
+          - os: ubuntu-22.04
+            asset: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            asset: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: name the build after the tag
+        shell: bash
+        run: |
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            v='${{ inputs.version }}'
+          else
+            v='${{ github.ref_name }}'
+          fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          sed -i.bak -E "0,/^version = /s//version = \"${v#v}\"/" Cargo.toml && rm -f Cargo.toml.bak
+          grep '^version' Cargo.toml
+
+      - name: rust
+        run: rustup update stable && rustup default stable
+
+      - name: mac targets
+        if: matrix.os == 'macos-14'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: build (macOS, both architectures in one binary)
+        if: matrix.os == 'macos-14'
+        shell: bash
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/atvtools \
+            target/aarch64-apple-darwin/release/atvtools \
+            target/x86_64-apple-darwin/release/atvtools
+          cp README.md dist/
+          tar -czf "atvtools-${VERSION}-macos-universal.tar.gz" -C dist atvtools README.md
+
+      - name: build (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+          cargo build --release
+          mkdir -p dist
+          cp target/release/atvtools README.md dist/
+          tar -czf "atvtools-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -C dist atvtools README.md
+
+      - name: build (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          cargo build --release
+          mkdir -p dist
+          cp target/release/atvtools.exe README.md dist/
+          cd dist
+          tar -a -c -f "../atvtools-${VERSION}-x86_64-pc-windows-msvc.zip" atvtools.exe README.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: atvtools-*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            v='${{ inputs.version }}'
+          else
+            v='${{ github.ref_name }}'
+          fi
+          ls -l dist
+          gh release create "$v" dist/* --title "$v" --generate-notes
