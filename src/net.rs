@@ -102,9 +102,19 @@ pub fn neighbours() -> Vec<String> {
 
 /// `adb mdns services` rows that are connect endpoints, as "host:port".
 pub fn parse_mdns(text: &str) -> Vec<String> {
+    endpoints(text, &["_adb-tls-connect._tcp", "_adb._tcp"])
+}
+
+/// Pairing endpoints (`_adb-tls-pairing._tcp`): a different port from the connect ones, and
+/// only advertised while the TV shows the "Pair device with pairing code" dialog.
+pub fn parse_mdns_pairing(text: &str) -> Vec<String> {
+    endpoints(text, &["_adb-tls-pairing._tcp"])
+}
+
+fn endpoints(text: &str, services: &[&str]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in text.lines() {
-        if !(line.contains("_adb-tls-connect._tcp") || line.contains("_adb._tcp")) {
+        if !services.iter().any(|s| line.contains(s)) {
             continue;
         }
         let Some(last) = line.split_whitespace().last() else { continue };
@@ -118,6 +128,11 @@ pub fn parse_mdns(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Pairing addresses advertised right now.
+pub fn pairing_candidates(adb: &Adb) -> Vec<String> {
+    parse_mdns_pairing(&adb.try_out(&["mdns", "services"]))
 }
 
 /// Every address worth trying, mDNS first, then the neighbour table.
@@ -179,6 +194,13 @@ mod tests {
     fn mdns_rows_become_host_port_pairs() {
         let out = "List of discovered mdns services\nadb-1234\t_adb-tls-connect._tcp\t192.168.1.42:39115\nadb-5678\t_adb._tcp\t192.168.1.42:5555\npair\t_adb-tls-pairing._tcp\t192.168.1.42:37061";
         assert_eq!(parse_mdns(out), vec!["192.168.1.42:39115", "192.168.1.42:5555"]);
+    }
+
+    #[test]
+    fn pairing_rows_are_kept_apart_from_connect_rows() {
+        let out = "adb-1234\t_adb-tls-connect._tcp\t192.168.1.42:39115\nadb-5678\t_adb._tcp\t192.168.1.42:5555\npair\t_adb-tls-pairing._tcp\t192.168.1.42:37061";
+        assert_eq!(parse_mdns_pairing(out), vec!["192.168.1.42:37061"]);
+        assert!(!parse_mdns(out).contains(&"192.168.1.42:37061".to_string()));
     }
 
     #[test]

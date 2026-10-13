@@ -6,9 +6,10 @@
 
 use crate::adb::Adb;
 use crate::apps::{self, Scope};
-use crate::{catalog, device, download, net, screen, settings, uad};
+use crate::{catalog, device, download, net, screen, settings, transfer, uad};
 use anyhow::Result;
 use eframe::egui;
+use std::path::PathBuf;
 
 const SHOT: &str = "atvtools-shot.png";
 const SCOPES: [&str; 3] = ["third-party", "system", "all"];
@@ -17,11 +18,26 @@ const SCOPES: [&str; 3] = ["third-party", "system", "all"];
 enum Tab {
     Connect,
     Apps,
+    Files,
     Debloat,
     Settings,
     Screen,
     Remote,
     Helpers,
+}
+
+/// Every activity line also lands in ~/.atvtools/log.
+// shortcut: the file grows without rotation; trim it if a long-running install session matters.
+fn append_log(line: &str) {
+    use std::io::Write as _;
+    let Some(dir) = uad::home_dir().map(|h| h.join(".atvtools")) else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log")) else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
 }
 
 pub fn run(serial: Option<String>) -> Result<()> {
@@ -59,6 +75,8 @@ struct App {
     scale: String,
     seconds: String,
     replace: bool,
+    remote_path: String,
+    local_path: String,
 }
 
 impl App {
@@ -83,6 +101,8 @@ impl App {
             scale: String::new(),
             seconds: "20".to_string(),
             replace: false,
+            remote_path: transfer::DOWNLOADS.to_string(),
+            local_path: String::new(),
         };
         app.say("atvtools GUI. Connect to a TV on the first tab, then pick a tab above.");
         app
@@ -99,7 +119,8 @@ impl App {
     fn say(&mut self, line: impl Into<String>) {
         let line = line.into();
         if !line.trim().is_empty() {
-            self.log.push(line);
+            self.log.push(line.clone());
+            append_log(&line);
         }
         if self.log.len() > 400 {
             self.log.drain(0..200);
@@ -296,6 +317,49 @@ impl App {
                     });
                 }
             });
+    }
+
+    fn files_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Files");
+        ui.label("adb moves the bytes; no app on the TV and no open port are needed.");
+        ui.horizontal(|ui| {
+            ui.label("on the TV");
+            ui.add(egui::TextEdit::singleline(&mut self.remote_path).desired_width(280.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("on this machine");
+            ui.add(egui::TextEdit::singleline(&mut self.local_path).desired_width(280.0));
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("list TV folder").clicked() {
+                let remote = self.remote_path.clone();
+                self.act("ls", move |adb| Ok(transfer::ls(adb, &remote)?.trim().to_string()));
+            }
+            if ui.button("send to TV").clicked() {
+                let remote = self.remote_path.clone();
+                let local = PathBuf::from(self.local_path.clone());
+                self.act("push", move |adb| {
+                    transfer::push(adb, &local, &remote)?;
+                    Ok(format!("sent {}", local.display()))
+                });
+            }
+            if ui.button("copy from TV").clicked() {
+                let remote = self.remote_path.clone();
+                let local = PathBuf::from(self.local_path.clone());
+                self.act("pull", move |adb| {
+                    transfer::pull(adb, &remote, &local)?;
+                    Ok(format!("copied to {}", local.display()))
+                });
+            }
+            if ui.button("make folder").clicked() {
+                let remote = self.remote_path.clone();
+                self.act("mkdir", move |adb| {
+                    transfer::mkdir(adb, &remote)?;
+                    Ok(format!("created {remote}"))
+                });
+            }
+        });
+        ui.label(format!("sideloads land in {}", transfer::DOWNLOADS));
     }
 
     fn debloat_tab(&mut self, ui: &mut egui::Ui) {
@@ -560,6 +624,9 @@ impl App {
                     device::optimize(adb)
                 });
             }
+            if ui.button("uad gui (universal debloater)").clicked() {
+                self.act("uad gui", |adb| uad::launch_gui(adb, false));
+            }
             if ui.button("check for updates").clicked() {
                 self.act("update", |_adb| {
                     crate::update::check(env!("CARGO_PKG_VERSION"), None)
@@ -603,6 +670,7 @@ impl eframe::App for App {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Connect, "Connect");
                 ui.selectable_value(&mut self.tab, Tab::Apps, "Apps");
+                ui.selectable_value(&mut self.tab, Tab::Files, "Files");
                 ui.selectable_value(&mut self.tab, Tab::Debloat, "Debloat");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
                 ui.selectable_value(&mut self.tab, Tab::Screen, "Screen");
@@ -632,6 +700,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| match tab {
             Tab::Connect => self.connect_tab(ui),
             Tab::Apps => self.apps_tab(ui),
+            Tab::Files => self.files_tab(ui),
             Tab::Debloat => self.debloat_tab(ui),
             Tab::Settings => self.settings_tab(ui),
             Tab::Screen => self.screen_tab(ui),

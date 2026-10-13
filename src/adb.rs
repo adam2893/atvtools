@@ -17,7 +17,9 @@ pub struct Adb {
 /// adb already said something self-explanatory.
 pub fn advice(text: &str) -> &'static str {
     let t = text.to_ascii_lowercase();
-    if t.contains("unauthorized") {
+    if t.contains("wrong password") || t.contains("failed to pair") {
+        "the pairing code was refused: reopen \"Pair device with pairing code\" on the TV and type the 6 digits it shows now"
+    } else if t.contains("unauthorized") {
         "the TV has not allowed this computer: accept the \"Allow debugging?\" dialog on the TV (never appeared? Developer options > revoke authorisations, then reconnect)"
     } else if t.contains("more than one device") {
         "several TVs are attached: choose one with -s <serial>, or press T in the menu"
@@ -112,6 +114,16 @@ impl Adb {
 
     pub fn disconnect(&self) -> Result<String> {
         self.out(&["disconnect"])
+    }
+
+    /// The same handle with no `-s`: pair and connect talk to the adb server, not to a device.
+    pub fn server(&self) -> Adb {
+        Adb { serial: None, bin: self.bin.clone() }
+    }
+
+    /// `adb pair <host:port> <code>` — Android 11+ wireless debugging.
+    pub fn pair(&self, addr: &str, code: &str) -> Result<String> {
+        self.server().out(&["pair", addr, code])
     }
 
     pub fn shell(&self, cmd: &str) -> Result<String> {

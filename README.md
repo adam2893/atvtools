@@ -25,9 +25,11 @@ subcommand for scripting.
 ## Usage
 
 ```sh
-atvtools devices
+atvtools devices                 # add --json for one JSON object per TV
 atvtools connect                 # scan this network and list the TVs that answered
 atvtools connect 192.168.1.50    # or connect straight to a known address
+atvtools pair                    # list the pairing ports on this network (Android 11+)
+atvtools pair 192.168.1.50:37123 --code 123456   # wireless debugging pairing
 atvtools -s 192.168.1.50:5555 apps list --scope third-party
 atvtools -s 192.168.1.50:5555 apps install ./app.apk
 atvtools -s 192.168.1.50:5555 apps disable com.example.bloat
@@ -37,9 +39,10 @@ atvtools -s 192.168.1.50:5555 settings adblock-on
 atvtools -s 192.168.1.50:5555 screen shot shot.png
 atvtools -s 192.168.1.50:5555 install smarttube
 atvtools -s 192.168.1.50:5555 preset apply google-tv-ads --yes
+atvtools -s 192.168.1.50:5555 install smarttube --all-devices   # every attached TV
 atvtools                         # bare invocation = the interactive menu
 atvtools menu --lang es
-atvtools gui                     # native window: Connect / Apps / Debloat / Settings / Screen / Remote / Helpers
+atvtools gui                     # native window: Connect / Apps / Files / Debloat / Settings / Screen / Remote / Helpers
 
 # added over the Windows tool
 atvtools -s 192.168.1.50:5555 remote                 # keypad in this terminal
@@ -70,11 +73,12 @@ an [egui](https://github.com/emilk/egui) window with the same reach as the CLI:
 |---|---|
 | Connect | type or scan for the TV, connect, list attached devices |
 | Apps | scope filter, package table, tick rows, then disable / enable / uninstall / launch / force stop / info |
+| Files | type a folder on the TV and a path on this machine, then list / send / copy from / make folder |
 | Debloat | pick a scope and a UAD removal level, scan, tick, disable or re-enable |
 | Settings | density, font scale, AdGuard DNS, OTA blocking, the on/off toggles, settings-screen shortcuts |
 | Screen | screenshot, timed screen recording, scrcpy |
 | Remote | every keycode as a button, plus text, URL, wake/sleep/reboot and the notification shade |
-| Helpers | doctor, device info, optimize, update check, catalog installs (a tick box removes an existing copy of the same id first, e.g. official Shizuku → fork) |
+| Helpers | doctor, device info, optimize, update check, `uad gui`, catalog installs (a tick box removes an existing copy of the same id first, e.g. official Shizuku → fork) |
 
 Everything the GUI runs it runs through the same modules as the CLI, so a button
 and its subcommand behave identically. The activity pane at the bottom keeps the
@@ -84,11 +88,11 @@ last 400 lines of what was executed.
 
 | Original (v4.0) | atvtools |
 |---|---|
-| IP connection screen (ARP scan, FIND/LOG/HELP) | `C` in the menu; `atvtools connect` scans and lists what answered, `connect <host>` connects, `mdns`, `history` |
+| IP connection screen (ARP scan, FIND/LOG/HELP) | `C` in the menu; `atvtools connect` scans and lists what answered, `connect <host>` connects, `pair <host:port> --code <6 digits>` for Android 11+ wireless debugging, `mdns`, `history` |
 | A Remote Control (cmdmax.exe + RC_Emulator.bat) | `remote` (interactive keypad), `remote uudok` (scripted), `screen scrcpy`; `doctor` covers the console diagnostics |
 | B Remove ads (AdGuard DNS / AdGuard TV) | `settings adblock-on`, `install adguard-tv` |
-| 1 Transfer files / clipboard | `transfer push\|pull\|ls\|mkdir`, `device text` — no FTP app on the TV needed |
-| 2 Install / uninstall / enable / disable / debloat | `apps install\|uninstall\|disable\|enable\|backup`, `preset apply` |
+| 1 Transfer files / clipboard | `transfer push\|pull\|ls\|mkdir`, `device text` — no FTP app on the TV needed; the GUI's Files tab drives the same four |
+| 2 Install / uninstall / enable / disable / debloat | `apps install\|uninstall\|disable\|enable\|backup`, `preset apply`; `--all-devices` runs an install, preset or toggle on every authorized TV |
 | 3 Backup and restore | `apps backup`; restoring is `apps install` on the pulled APKs |
 | 4 Custom settings (ad protection, NTP, storage grants, OTA, idle timeout) | `settings adblock-*`, `settings ntp`, `apps appop --all storage`, `settings ota`, `settings idle-timeout` |
 | 5 Density / font scale | `settings set-density`, `settings set-font-scale` |

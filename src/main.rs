@@ -45,11 +45,23 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// List attached devices.
-    Devices,
+    Devices {
+        /// One JSON object per device.
+        #[arg(long)]
+        json: bool,
+    },
     /// Connect to a TV over the network; with no address, scan for one (port 5555 assumed).
     Connect { host: Option<String> },
     /// Disconnect network devices.
     Disconnect,
+    /// Pair for Android 11+ wireless debugging; with no address, list the pairing ports.
+    Pair {
+        /// The host:port the pairing dialog shows.
+        addr: Option<String>,
+        /// The 6-digit code shown next to it.
+        #[arg(long)]
+        code: Option<String>,
+    },
     /// Run a raw adb shell command.
     Shell { command: Vec<String> },
     /// Package management.
@@ -75,6 +87,9 @@ enum Cmd {
         /// Remove an existing copy first when its signature differs
         #[arg(long)]
         replace: bool,
+        /// Run on every authorized TV.
+        #[arg(long)]
+        all_devices: bool,
     },
     /// Debloat presets.
     Preset {
@@ -82,7 +97,11 @@ enum Cmd {
         op: PresetOp,
     },
     /// Device facts: model, Android version, resolution, battery.
-    Info,
+    Info {
+        /// One JSON object.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remote keys, text, power, intents, settings screens.
     Device {
         #[command(subcommand)]
@@ -100,6 +119,9 @@ enum Cmd {
         /// List the known toggles.
         #[arg(long)]
         list: bool,
+        /// Run on every authorized TV.
+        #[arg(long)]
+        all_devices: bool,
     },
     /// Screen-off timeout in milliseconds (no argument prints it).
     ScreenTimeout { ms: Option<u32> },
@@ -124,7 +146,11 @@ enum Cmd {
     /// Previously connected devices.
     History,
     /// Animation scales, cache trim, background app kill.
-    Optimize,
+    Optimize {
+        /// Run on every authorized TV.
+        #[arg(long)]
+        all_devices: bool,
+    },
     /// Push and pull files between this machine and the TV.
     Transfer {
         #[command(subcommand)]
@@ -304,6 +330,9 @@ enum AppsOp {
         /// Only packages installed from the Play Store.
         #[arg(long)]
         play_only: bool,
+        /// One JSON object per package.
+        #[arg(long)]
+        json: bool,
     },
     /// Install one or more APK files.
     Install {
@@ -311,6 +340,9 @@ enum AppsOp {
         /// Remove an existing copy first when its signature differs (fork vs official Shizuku)
         #[arg(long)]
         replace: bool,
+        /// Run on every authorized TV.
+        #[arg(long)]
+        all_devices: bool,
     },
     /// Uninstall packages for user 0.
     Uninstall { package: Vec<String> },
@@ -467,6 +499,9 @@ enum PresetOp {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+        /// Run on every authorized TV.
+        #[arg(long)]
+        all_devices: bool,
     },
     /// Re-enable every package of a preset.
     Undo { name: String },
@@ -488,15 +523,60 @@ mod tests {
     }
 }
 
+/// The devices a fan-out command touches: the one adb is pointed at, or every authorized TV.
+fn fanout(adb: &Adb, all: bool) -> Result<Vec<Adb>> {
+    if !all {
+        return Ok(vec![adb.clone()]);
+    }
+    let found: Vec<Adb> = adb
+        .devices()?
+        .into_iter()
+        .filter(|d| d.state == "device")
+        .map(|d| Adb { serial: Some(d.serial), bin: adb.bin.clone() })
+        .collect();
+    if found.is_empty() {
+        anyhow::bail!("--all-devices found no authorized TV; run: atvtools devices");
+    }
+    Ok(found)
+}
+
+/// Runs one action per target, with a header per TV when there is more than one.
+fn run_each(adb: &Adb, all: bool, mut f: impl FnMut(&Adb) -> Result<()>) -> Result<()> {
+    let targets = fanout(adb, all)?;
+    let many = targets.len() > 1;
+    for a in &targets {
+        if many {
+            println!("== {}", a.serial.as_deref().unwrap_or("default device"));
+        }
+        f(a)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let adb = Adb::new(cli.serial.clone());
 
     let cmd = cli.cmd.unwrap_or(Cmd::Menu { lang: "en".to_string() });
     match cmd {
-        Cmd::Devices => {
-            for d in adb.devices()? {
-                println!("{}\t{}\t{}", d.serial, d.state, d.model.unwrap_or_default());
+        Cmd::Devices { json } => {
+            let found = adb.devices()?;
+            if json {
+                let rows: Vec<serde_json::Value> = found
+                    .iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "serial": &d.serial,
+                            "state": &d.state,
+                            "model": &d.model,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                for d in found {
+                    println!("{}\t{}\t{}", d.serial, d.state, d.model.unwrap_or_default());
+                }
             }
         }
         Cmd::Connect { host } => match host {
@@ -518,6 +598,25 @@ fn main() -> Result<()> {
             }
         },
         Cmd::Disconnect => println!("{}", adb.disconnect()?.trim()),
+        Cmd::Pair { addr, code } => match (addr, code) {
+            (Some(addr), Some(code)) => println!("{}", adb.pair(&addr, &code)?.trim()),
+            (Some(_), None) => anyhow::bail!(
+                "pairing needs the 6-digit code from the TV: atvtools pair <host:port> --code 123456"
+            ),
+            (None, _) => {
+                let found = net::pairing_candidates(&adb);
+                if found.is_empty() {
+                    println!("no TV is offering a pairing port right now");
+                    println!("  - on the TV: Developer options > Wireless debugging > Pair device with pairing code");
+                    println!("  - then: atvtools pair <host:port> --code <6 digits>");
+                } else {
+                    for h in &found {
+                        println!("{h}");
+                    }
+                    println!("pair with: atvtools pair <host:port> --code <6 digits>");
+                }
+            }
+        },
         Cmd::Shell { command } => {
             if command.is_empty() {
                 adb.run(&["shell"])?;   // attached, interactive
@@ -526,7 +625,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Apps { op } => match op {
-            AppsOp::List { scope, paths, installer, play_only } => {
+            AppsOp::List { scope, paths, installer, play_only, json } => {
                 if play_only {
                     for p in apps::play_store_packages(&adb)? {
                         println!("{p}");
@@ -537,21 +636,38 @@ fn main() -> Result<()> {
                         ScopeArg::System => apps::Scope::System,
                         ScopeArg::All => apps::Scope::All,
                     };
-                    for r in apps::list_rows(&adb, scope, paths, installer)? {
-                        if paths || installer {
-                            println!(
-                                "{:<40} {}{}",
-                                r.package,
-                                r.apk_path.unwrap_or_default(),
-                                r.installer.map(|i| format!(" [{i}]")).unwrap_or_default()
-                            );
-                        } else {
-                            println!("{}", r.package);
+                    let rows = apps::list_rows(&adb, scope, paths, installer)?;
+                    if json {
+                        let out: Vec<serde_json::Value> = rows
+                            .iter()
+                            .map(|r| {
+                                serde_json::json!({
+                                    "package": &r.package,
+                                    "apk_path": &r.apk_path,
+                                    "installer": &r.installer,
+                                })
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        for r in rows {
+                            if paths || installer {
+                                println!(
+                                    "{:<40} {}{}",
+                                    r.package,
+                                    r.apk_path.unwrap_or_default(),
+                                    r.installer.map(|i| format!(" [{i}]")).unwrap_or_default()
+                                );
+                            } else {
+                                println!("{}", r.package);
+                            }
                         }
                     }
                 }
             }
-            AppsOp::Install { apk, replace } => apps::install_with(&adb, &apk, replace)?,
+            AppsOp::Install { apk, replace, all_devices } => {
+                run_each(&adb, all_devices, |a| apps::install_with(a, &apk, replace))?
+            }
             AppsOp::Uninstall { package } => apps::uninstall(&adb, &package)?,
             AppsOp::Disable { package } => apps::set_enabled(&adb, &package, false)?,
             AppsOp::Enable { package } => apps::set_enabled(&adb, &package, true)?,
@@ -626,7 +742,9 @@ fn main() -> Result<()> {
                 println!("{:<24} {}", e.name, e.note);
             }
         }
-        Cmd::Install { name, replace } => download::install_catalog_with(&adb, &name, replace)?,
+        Cmd::Install { name, replace, all_devices } => {
+            run_each(&adb, all_devices, |a| download::install_catalog_with(a, &name, replace))?
+        }
         Cmd::Shizuku { op } => match op {
             ShizukuOp::Install { replace } => {
                 let e = catalog::find("shizuku-fork")
@@ -645,7 +763,7 @@ fn main() -> Result<()> {
                     println!("{:<16} {}", p.title, p.description);
                 }
             }
-            PresetOp::Apply { name, yes } => {
+            PresetOp::Apply { name, yes, all_devices } => {
                 let p = debloat::find_any(&name)
                     .ok_or_else(|| anyhow::anyhow!("unknown preset '{name}'. known: {}", debloat::titles()))?;
                 if !yes && !confirm(&format!("disable {} packages from '{}'?", p.packages.len(), p.title))? {
@@ -653,7 +771,7 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 let pkgs: Vec<String> = p.packages.iter().map(|s| (*s).to_string()).collect();
-                apps::set_enabled(&adb, &pkgs, false)?;
+                run_each(&adb, all_devices, |a| apps::set_enabled(a, &pkgs, false))?;
             }
             PresetOp::Undo { name } => {
                 let p = debloat::find_any(&name)
@@ -662,9 +780,18 @@ fn main() -> Result<()> {
                 apps::set_enabled(&adb, &pkgs, true)?;
             }
         },
-        Cmd::Info => {
-            for (k, v) in device::info(&adb)? {
-                println!("{k:<14} {v}");
+        Cmd::Info { json } => {
+            let rows = device::info(&adb)?;
+            if json {
+                let obj: serde_json::Map<String, serde_json::Value> = rows
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            } else {
+                for (k, v) in rows {
+                    println!("{k:<14} {v}");
+                }
             }
         }
         Cmd::Device { op } => match op {
@@ -678,13 +805,15 @@ fn main() -> Result<()> {
             DeviceOp::Screens => println!("{}", device::screen_names()),
             DeviceOp::Notifications => device::expand_notifications(&adb)?,
         },
-        Cmd::Toggle { name, on, off, list } => {
+        Cmd::Toggle { name, on, off, list, all_devices } => {
             if list || name.is_none() {
                 println!("{}", settings::toggle_names());
             } else {
                 let n = name.unwrap_or_default();
                 let state = if on { Some(true) } else if off { Some(false) } else { None };
-                println!("{n} = {}", settings::toggle(&adb, &n, state)?);
+                run_each(&adb, all_devices, |a| {
+                    settings::toggle(a, &n, state).map(|v| println!("{n} = {v}"))
+                })?;
             }
         }
         Cmd::ScreenTimeout { ms } => println!("{}", settings::screen_off_timeout(&adb, ms)?),
@@ -705,7 +834,10 @@ fn main() -> Result<()> {
                 println!("{h}");
             }
         }
-        Cmd::Optimize => print!("{}", device::optimize(&adb)?),
+        Cmd::Optimize { all_devices } => run_each(&adb, all_devices, |a| {
+            print!("{}", device::optimize(a)?);
+            Ok(())
+        })?,
         Cmd::Transfer { op } => match op {
             TransferOp::Push { local, remote } => transfer::push(&adb, &local, &remote)?,
             TransferOp::Pull { remote, local } => transfer::pull(&adb, &remote, &local)?,
@@ -888,4 +1020,64 @@ fn confirm(question: &str) -> Result<bool> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+}
+
+
+/// Tests for the fan-out helper and for pairing never carrying a "-s".
+#[cfg(all(test, unix))]
+mod cli_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    fn fake_adb(dir: &Path, body: &str) -> String {
+        let path = dir.join("adb");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake adb");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path.to_string_lossy().to_string()
+    }
+
+    /// One directory per test: they run in parallel and each writes its own fake adb.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atvtools-cli-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn without_all_devices_the_given_handle_is_the_only_target() {
+        let adb = Adb { serial: Some("tv:5555".into()), bin: "/nonexistent/adb".into() };
+        let targets = fanout(&adb, false).expect("one target");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].serial.as_deref(), Some("tv:5555"));
+    }
+
+    #[test]
+    fn all_devices_keeps_only_authorized_tvs() {
+        let dir = scratch("devices");
+        let bin = fake_adb(
+            &dir,
+            r#"echo 'List of devices attached'
+printf 'tv1:5555\tdevice product:x model:TV_One transport_id:1\n'
+printf 'tv2:5555\tunauthorized usb:1-1\n'"#,
+        );
+        let adb = Adb { serial: None, bin };
+        let targets = fanout(&adb, true).expect("targets");
+        let serials: Vec<String> = targets.iter().filter_map(|t| t.serial.clone()).collect();
+        assert_eq!(serials, vec!["tv1:5555".to_string()]);
+    }
+
+    #[test]
+    fn pairing_runs_without_a_device_argument() {
+        let dir = scratch("pair");
+        let argv = dir.join("argv.txt");
+        let bin = fake_adb(&dir, &format!(r#"printf '%s\n' "$@" > {}"#, argv.display()));
+        let adb = Adb { serial: Some("tv:5555".into()), bin };
+        adb.pair("192.168.1.105:37061", "123456").expect("pair");
+        let seen = std::fs::read_to_string(&argv).expect("argv file");
+        assert_eq!(
+            seen.lines().collect::<Vec<_>>(),
+            vec!["pair", "192.168.1.105:37061", "123456"]
+        );
+    }
 }
