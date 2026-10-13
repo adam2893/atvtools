@@ -38,8 +38,8 @@ jobs:
             v='${{ github.ref_name }}'
           fi
           echo "VERSION=$v" >> "$GITHUB_ENV"
-          sed -i.bak -E "0,/^version = /s//version = \"${v#v}\"/" Cargo.toml && rm -f Cargo.toml.bak
-          grep '^version' Cargo.toml
+          sed -i.bak -E "s/^version = .*/version = \"${v#v}\"/" Cargo.toml && rm -f Cargo.toml.bak
+          grep -qx "version = \"${v#v}\"" Cargo.toml
 
       - name: rust
         run: rustup update stable && rustup default stable
