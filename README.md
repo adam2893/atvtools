@@ -1,17 +1,26 @@
 # atvtools — cross-platform Android TV / Google TV toolbox
 
-Rust port of **Android TV Tools v4.0** (`Android TV Tools v4.0_EN.exe`).
+Feature set modelled on **Android TV Tools v4.0** (`Android TV Tools v4.0_EN.exe`),
+reimplemented from scratch in Rust. Nothing of the original ships here: no batch
+script, no `cmdmax.exe`, no XDA attachments.
 
 The original is a Windows-only self-extracting EXE that unpacks a 341 KB batch
 script, shells out to `adb`, downloads APKs and drives `cmd.exe` for its UI.
-This port keeps the behaviour and drops the Windows dependency: one binary that
-talks to `adb` directly on macOS, Linux and Windows.
+This implementation keeps the behaviour and drops the Windows dependency: one
+binary that talks to `adb` directly on macOS, Linux and Windows.
 
 ## Download
 
 Prebuilt binaries are on the [releases page](https://github.com/adam2893/atvtools/releases):
 macOS (one universal binary, Intel and Apple silicon), Linux x86-64 and Windows x86-64.
 Unpack it and put `atvtools` somewhere on your PATH — it is the CLI and the GUI in one file.
+
+The Linux build is compiled on Ubuntu 22.04, so it wants glibc 2.35 or newer
+(Ubuntu 22.04+, Debian 12+, Fedora 36+) plus the X11/Wayland libraries a window
+needs; on anything older, or on musl, `cargo install --git` is the way. The macOS
+binary is unsigned and not notarised — the first launch needs right-click → Open,
+or `xattr -d com.apple.quarantine atvtools`. Only x86-64 Linux is built today, and
+the Windows binary is built and packaged by CI but has not been run here.
 
 ## Build
 
@@ -51,6 +60,8 @@ atvtools -s 192.168.1.50:5555 screen shot shot.png
 atvtools -s 192.168.1.50:5555 install smarttube
 atvtools -s 192.168.1.50:5555 preset apply google-tv-ads --yes
 atvtools -s 192.168.1.50:5555 install smarttube --all-devices   # every attached TV
+atvtools -s 192.168.1.50:5555 apps install ./shizuku.apk --replace   # the installed copy has a different signature
+atvtools -s 192.168.1.50:5555 preset undo google-tv-ads   # re-enable what a preset disabled
 atvtools                         # bare invocation = the interactive menu
 atvtools menu --lang es
 atvtools gui                     # native window: Connect / Apps / Files / Debloat / Settings / Screen / Remote / Helpers
@@ -105,8 +116,8 @@ A profile is a small TOML file (`.atvtools.toml`): an optional `[device] serial`
 `[settings]` density / font scale / private DNS / screen-off timeout, and
 `[apps] install`, `disable`, `enable` lists. `apply` prints the plan first and
 asks before changing anything; `preset export` writes the file from the TV you
-are connected to. Every disable also lands in `~/.atvtools/undo`, so `undo` can
-put it back.
+are connected to. Every disable also lands in `~/.atvtools/undo`, so `undo` (or
+`preset undo <name>`) can put it back.
 
 ## GUI
 
@@ -145,7 +156,7 @@ last 400 lines of what was executed; everything it prints is also appended to
 | 7 Installer helper (SmartTube, launchers, stores, IPTV) | `catalog`, `install <name>`, `iptv install\|add\|open` |
 | 8 Optimizations (Perf_Optim.bat) | `optimize` |
 
-## Not ported as a bundled binary, and why
+## Not bundled as a binary, and why
 
 - **cmdmax.exe** — its job was resizing console windows on Windows. The keypad
   is now `remote` in any terminal, the device list is `devices`/`history`,
@@ -172,7 +183,7 @@ last 400 lines of what was executed; everything it prints is also appended to
 - **2000 lines of coloured `echo`** — replaced by the ANSI `menu` (EN/ES) plus
   subcommands, so the same steps can be scripted.
 
-## Port notes
+## Implementation notes
 
 - Finding the TV: `adb mdns services` first, then the host neighbour table
   (`arp -an` / `ip neigh` / `arp -a`). Each candidate is TCP-checked on its adb
@@ -211,7 +222,7 @@ the user; **no** = not ported.
 | Original feature | Status | atvtools |
 | --- | --- | --- |
 | View/control the TV from the PC with scrcpy | yes | `screen scrcpy` |
-| Remote control emulator (key events) | yes | `device key up/down/ok/home/playpause/...` (30 names, or a raw keycode) |
+| Remote control emulator (key events) | yes | `device key up/down/ok/home/playpause/...` (41 names, or a raw keycode) |
 | Ad blocker (remove ads) | yes | `settings adblock-on` / `adblock-off` / `dns` |
 | Install AdGuard for Android TV | yes | `install adguard-tv` |
 | Send text from PC to TV | yes | `device text "hello world"` |
@@ -220,7 +231,7 @@ the user; **no** = not ported.
 | Uninstall apps | yes | `apps uninstall <pkg...>` |
 | Enable/disable apps | yes | `apps disable/enable <pkg...>` |
 | Package name + version recognition | yes | `apps info <pkg>`, `apps list --paths --installer` |
-| Universal Android Debloater | yes | `uad list/info/apply/refresh` runs the upstream database (2400 entries, Recommended/Advanced/Expert/Unsafe) natively, plus the TV-specific `preset` list; the GUI's Debloat tab drives the same scan. Upstream's own cross-platform window is on tap with `uad gui` (its `uad_gui-windows.exe` was all the original batch ever downloaded) |
+| Universal Android Debloater | yes | `uad list/info/apply/refresh` runs the upstream database (about 2400 entries, Recommended/Advanced/Expert/Unsafe) natively, plus the TV-specific `preset` list; the GUI's Debloat tab drives the same scan. Upstream's own cross-platform window is on tap with `uad gui` (its `uad_gui-windows.exe` was all the original batch ever downloaded) |
 | Back up / restore all apps | yes | `apps backup-all`, `apps restore <dir>` |
 | List Play-Store-installed apps (and non-Play ones) | yes | `apps list --play-only --installer` |
 | Manage permissions; list packages holding one | yes | `apps grant/revoke`, `apps with-permission <perm>` |
