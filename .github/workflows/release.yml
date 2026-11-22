@@ -19,7 +19,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-latest
             asset: macos-universal
           - os: ubuntu-22.04
             asset: x86_64-unknown-linux-gnu
@@ -45,11 +45,11 @@ jobs:
         run: rustup update stable && rustup default stable
 
       - name: mac targets
-        if: matrix.os == 'macos-14'
+        if: matrix.os == 'macos-latest'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: build (macOS, both architectures in one binary)
-        if: matrix.os == 'macos-14'
+        if: matrix.os == 'macos-latest'
         shell: bash
         run: |
           cargo build --release --target aarch64-apple-darwin
