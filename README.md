@@ -18,18 +18,19 @@
 
 Smart TVs ship loaded with ad-heavy home screens, ACR tracking, OEM telemetry, and bloatware. **atvtools v5** lets you clean, debloat, customize, and control any Android TV or Google TV over Wi-Fi or USB from **macOS, Windows, or Linux** — in a single native binary with **built-in safety guards** so you don't brick your TV or lock yourself off Wi-Fi.
 
-### Highlights in v5.1
+### Highlights in v5.2
 
 - **Non-Blocking Desktop GUI + CLI in One Binary:** Responsive `egui` desktop app backed by background worker threads — never freezes during scans, downloads, or screenshots.
-- **Drag-and-Drop APK Sideloading:** Drop any `.apk` onto the GUI window to install, with automatic Android 14+ `pm install` shell fallback.
+- **Click-to-Tap Live Preview & Browser Remote:** Click anywhere on the TV screenshot to tap, enable 2.5s auto-refresh mirroring, switch **HDMI 1–4 / TV Input**, or start the phone **Browser Remote (:8080)** in one click.
+- **Drag-and-Drop APK Sideloading & App Permissions:** Drop any `.apk` onto the GUI window to install (with Android 14+ shell fallback), and grant `MANAGE_EXTERNAL_STORAGE` or `WRITE_SETTINGS` in one click.
 - **Brick & Wi-Fi Safety Guards:**
   - Blocks disabling core Android & MediaTek/CVTE TV middleware (`com.cltv.mal`, `com.mediatek.tis`, `android.ext.services`, `com.android.location.fused`, etc.).
   - Checks `dumpsys wifi` before touching `setupwraith` so disabling it won't delete your saved Wi-Fi network.
   - Prevents disabling the last usable `HOME` launcher on the TV and blocks launching OEM factory-test menus.
 - **Brand-Specific Presets & Fleet Sync:** Auto-detect TV brand (`ro.product.manufacturer`) for **TCL**, **Xiaomi (PatchWall)**, **Hisense**, **Sony Bravia**, **Philips**, and **Nvidia Shield**, or apply across all attached TVs at once.
 - **Privacy, ACR & Telemetry Audit + OTA Drift Fix:** Detects Inscape/Samba/Skyworth ACR, voice assistants, and OEM telemetry; catches firmware updates that re-enable bloatware and re-disables them safely.
-- **Storage, Snapshots & Logs:** Top-15 storage size analyzer, cache trimmer, one-click `.atvtools.toml` snapshots, filterable `logcat`/crash viewer, and `ro.adb.secure` security audit.
-- **Launchers, Remote Inspector & Privileged Helpers:** One-click install for **tvOS Launcher** (Apple TV style), **FLauncher**, and **Projectivy**, **fork-Shizuku** or **Stellar** (`roro2239/Stellar`), **USB -> Wi-Fi (5555)** switch, **Wake-on-LAN**, and live remote keycode/scancode inspector.
+- **System Health, Storage, Snapshots & Logs:** At-a-glance RAM/storage/uptime health card, top-15 storage analyzer, cache trimmer, `.atvtools.toml` snapshots, filterable `logcat`/crash viewer, and `ro.adb.secure` security audit.
+- **Launchers, Screensavers & Privileged Helpers:** One-click install for **tvOS Launcher** (Apple TV style), **FLauncher**, and **Projectivy**, custom screensaver picker (e.g. Aerial Views), **fork-Shizuku** or **Stellar** (`roro2239/Stellar`), **USB -> Wi-Fi (5555)** switch, **Wake-on-LAN**, and live remote keycode/scancode inspector.
 - **UAD-ng Inspired ADB Engine:** Typed ADB command builder, Windows `CREATE_NO_WINDOW` support, and clear, human-readable OEM error messages.
 
 ---

@@ -3,7 +3,7 @@
 
 use crate::adb::{Adb, Device};
 use crate::apps::{self, Scope};
-use crate::{catalog, debloat, device, download, logs, net, profile, screen, settings, shizuku, transfer, tv_safety, uad, undo};
+use crate::{catalog, debloat, device, download, logs, net, profile, remote, screen, settings, shizuku, transfer, tv_safety, uad, undo};
 use anyhow::Result;
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke};
 use std::path::PathBuf;
@@ -68,6 +68,7 @@ enum WorkerMsg {
     Brand(String),
     Sizes(Vec<(String, u64, u64)>),
     LogOutput(String),
+    Health(tv_safety::SystemHealth),
     Screenshot(PathBuf),
     SetTarget(String),
     Done(String),
@@ -200,10 +201,16 @@ struct App {
     log_grep: String,
     diag_output: String,
     fleet_all: bool,
+    health: Option<tv_safety::SystemHealth>,
+    screensaver_in: String,
+    live_preview: bool,
+    last_shot_at: Option<std::time::Instant>,
+    serving_remote: bool,
     seconds: String,
     remote_path: String,
     local_path: String,
     shot: Option<egui::TextureHandle>,
+    shot_size: Option<[usize; 2]>,
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
     in_flight: usize,
@@ -247,10 +254,16 @@ impl App {
             log_grep: String::new(),
             diag_output: String::new(),
             fleet_all: false,
+            health: None,
+            screensaver_in: "com.neilturner.aerialviews/.ui.screensaver.DreamActivity".to_string(),
+            live_preview: false,
+            last_shot_at: None,
+            serving_remote: false,
             seconds: "20".to_string(),
             remote_path: transfer::DOWNLOADS.to_string(),
             local_path: String::new(),
             shot: None,
+            shot_size: None,
             tx,
             rx,
             in_flight: 0,
@@ -318,6 +331,7 @@ impl App {
                 WorkerMsg::Brand(b) => self.detected_brand = b,
                 WorkerMsg::Sizes(s) => self.pkg_sizes = s,
                 WorkerMsg::LogOutput(s) => self.diag_output = s,
+                WorkerMsg::Health(h) => self.health = Some(h),
                 WorkerMsg::Screenshot(path) => self.preview(&path, ctx),
                 WorkerMsg::SetTarget(serial) => {
                     self.serial_input = serial.clone();
@@ -392,7 +406,28 @@ impl App {
                 if ui.button("Wake-on-LAN").clicked() {
                     self.spawn(ctx, "wake-lan", |adb, _| device::wake_lan(&adb));
                 }
+                if ui.button("System Health").clicked() {
+                    self.spawn(ctx, "health", |adb, tx| {
+                        let h = tv_safety::system_health(&adb)?;
+                        let summary = format!("Android {} (SDK {}), {} free", h.android, h.sdk, h.storage_free);
+                        let _ = tx.send(WorkerMsg::Health(h));
+                        Ok(summary)
+                    });
+                }
             });
+            if let Some(h) = &self.health {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    badge(ui, &format!("Android {} (SDK {})", h.android, h.sdk), ACCENT);
+                    if let Some(mb) = h.ram_avail_mb {
+                        badge(ui, &format!("{mb} MB RAM free"), if mb < 250 { STATUS_WARN } else { STATUS_OK });
+                    }
+                    badge(ui, &format!("{} /data free", h.storage_free), STATUS_OK);
+                    if !h.uptime.is_empty() {
+                        ui.label(RichText::new(&h.uptime).color(TEXT_MUTED).small());
+                    }
+                });
+            }
         });
 
         ui.add_space(6.0);
@@ -784,6 +819,24 @@ impl App {
                 if ui.button("Trim Caches").clicked() {
                     self.spawn(ctx, "trim caches", |adb, _| apps::trim_caches(&adb));
                 }
+                if ui.add_enabled(has_sel, egui::Button::new("Grant Storage")).clicked() {
+                    let pkgs = std::mem::take(&mut self.ticked);
+                    self.spawn(ctx, "grant storage", move |adb, _| {
+                        for p in &pkgs {
+                            apps::appop(&adb, p, "MANAGE_EXTERNAL_STORAGE", true)?;
+                        }
+                        Ok(format!("granted storage to {}", pkgs.len()))
+                    });
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Grant Write Settings")).clicked() {
+                    let pkgs = std::mem::take(&mut self.ticked);
+                    self.spawn(ctx, "grant write_settings", move |adb, _| {
+                        for p in &pkgs {
+                            apps::appop(&adb, p, "WRITE_SETTINGS", true)?;
+                        }
+                        Ok(format!("granted WRITE_SETTINGS to {}", pkgs.len()))
+                    });
+                }
             });
         });
         if !self.pkg_sizes.is_empty() {
@@ -1026,6 +1079,24 @@ impl App {
                     self.spawn(ctx, "ota", |adb, _| settings::ota_state(&adb));
                 }
             });
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Screensaver");
+                ui.add(egui::TextEdit::singleline(&mut self.screensaver_in).desired_width(280.0));
+                if ui.button("Set").clicked() {
+                    let comp = self.screensaver_in.trim().to_string();
+                    self.spawn(ctx, "screensaver", move |adb, _| {
+                        settings::screensaver(&adb, &comp)?;
+                        Ok(format!("set {comp}"))
+                    });
+                }
+                if ui.button("Off").clicked() {
+                    self.spawn(ctx, "screensaver", |adb, _| {
+                        settings::screensaver(&adb, "off")?;
+                        Ok("disabled".into())
+                    });
+                }
+            });
         });
         ui.add_space(6.0);
         card(ui, |ui| {
@@ -1098,12 +1169,41 @@ impl App {
                     if ui.button("Inspect Remote Key (4s)").clicked() {
                         self.spawn(ctx, "key inspector", |adb, _| tv_safety::read_last_key_event(&adb));
                     }
+                    if ui.add_enabled(!self.serving_remote, egui::Button::new("Browser Remote (:8080)")).clicked() {
+                        self.serving_remote = true;
+                        let adb = self.adb.clone();
+                        let tx = self.tx.clone();
+                        let ctx_bg = ctx.clone();
+                        std::thread::spawn(move || {
+                            let _ = remote::serve(&adb, "0.0.0.0:8080");
+                            let _ = tx.send(WorkerMsg::Done("browser remote: stopped".into()));
+                            ctx_bg.request_repaint();
+                        });
+                        self.say("Browser Remote listening on http://0.0.0.0:8080 (open on your phone)");
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Inputs");
+                    for (label, code) in [
+                        ("TV Input", "178"),
+                        ("HDMI 1", "243"),
+                        ("HDMI 2", "244"),
+                        ("HDMI 3", "245"),
+                        ("HDMI 4", "246"),
+                    ] {
+                        if ui.small_button(label).clicked() {
+                            let k = code.to_string();
+                            self.spawn(ctx, label, move |adb, _| {
+                                device::key(&adb, &[k]).map(|_| "sent".into())
+                            });
+                        }
+                    }
                 });
             });
             ui.add_space(6.0);
             card(ui, |ui| {
                 ui.strong("Screen Capture & Mirroring");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if primary_button(ui, "Screenshot").clicked() {
                         let dest = std::env::temp_dir().join(SHOT);
                         self.spawn(ctx, "screenshot", move |adb, tx| {
@@ -1113,6 +1213,7 @@ impl App {
                             Ok(format!("saved {p}"))
                         });
                     }
+                    ui.checkbox(&mut self.live_preview, "Live Preview (2.5s)");
                     ui.label("Seconds");
                     ui.add(egui::TextEdit::singleline(&mut self.seconds).desired_width(50.0));
                     if ui.button("Record").clicked() {
@@ -1132,9 +1233,44 @@ impl App {
                         });
                     }
                 });
+                if self.live_preview && self.in_flight == 0 {
+                    let due = self
+                        .last_shot_at
+                        .map(|t| t.elapsed() >= std::time::Duration::from_millis(2500))
+                        .unwrap_or(true);
+                    if due {
+                        self.last_shot_at = Some(std::time::Instant::now());
+                        let dest = std::env::temp_dir().join(SHOT);
+                        self.spawn(ctx, "live shot", move |adb, tx| {
+                            screen::screenshot(&adb, &dest)?;
+                            let _ = tx.send(WorkerMsg::Screenshot(dest));
+                            Ok("refreshed".into())
+                        });
+                    } else {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(400));
+                    }
+                }
                 if let Some(tex) = &self.shot {
                     ui.add_space(6.0);
-                    ui.add(egui::Image::new(egui::load::SizedTexture::from_handle(tex)).max_width(480.0));
+                    ui.label(RichText::new("Click anywhere on the screenshot to tap that spot on the TV.").color(TEXT_MUTED).small());
+                    let resp = ui.add(
+                        egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                            .max_width(520.0)
+                            .sense(egui::Sense::click()),
+                    );
+                    if resp.clicked() {
+                        if let (Some(pos), Some([tw, th])) = (resp.interact_pointer_pos(), self.shot_size) {
+                            let rect = resp.rect;
+                            let rx = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                            let ry = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+                            let tv_x = (rx * tw as f32).round() as u32;
+                            let tv_y = (ry * th as f32).round() as u32;
+                            self.spawn(ctx, format!("tap {tv_x},{tv_y}"), move |adb, _| {
+                                adb.shell(&format!("input tap {tv_x} {tv_y}"))?;
+                                Ok("tapped".into())
+                            });
+                        }
+                    }
                 }
             });
         });
@@ -1268,11 +1404,13 @@ impl App {
 
     fn preview(&mut self, path: &std::path::Path, ctx: &egui::Context) {
         self.shot = None;
+        self.shot_size = None;
         let Ok(bytes) = std::fs::read(path) else { return };
         match png_rgba(&bytes) {
             Some((w, h, rgba)) => {
                 let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
                 self.shot = Some(ctx.load_texture("shot", image, egui::TextureOptions::LINEAR));
+                self.shot_size = Some([w, h]);
             }
             None => self.say("preview: unsupported PNG format; open file directly"),
         }

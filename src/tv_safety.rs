@@ -320,6 +320,57 @@ pub fn security_audit(adb: &Adb) -> String {
     notes.join("\n")
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SystemHealth {
+    pub android: String,
+    pub sdk: String,
+    pub ram_avail_mb: Option<u64>,
+    pub storage_free: String,
+    pub uptime: String,
+}
+
+/// Parse `MemAvailable:` in kB from `/proc/meminfo` and return MB.
+pub fn parse_mem_available_mb(meminfo: &str) -> Option<u64> {
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+/// Parse `/data` free space from `df -h /data`.
+pub fn parse_df_free(df_out: &str) -> String {
+    df_out
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().nth(3))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Collect TV health stats (Android version, SDK, available RAM, `/data` free, uptime).
+pub fn system_health(adb: &Adb) -> Result<SystemHealth> {
+    let android = adb.try_out(&["shell", "getprop ro.build.version.release"]).trim().to_string();
+    let sdk = adb.try_out(&["shell", "getprop ro.build.version.sdk"]).trim().to_string();
+    let meminfo = adb.try_out(&["shell", "cat /proc/meminfo"]);
+    let df = adb.try_out(&["shell", "df -h /data"]);
+    let up = adb.try_out(&["shell", "uptime -p"]);
+    let uptime = if up.trim().is_empty() || up.contains("bad") {
+        adb.try_out(&["shell", "uptime"]).trim().to_string()
+    } else {
+        up.trim().to_string()
+    };
+    Ok(SystemHealth {
+        android,
+        sdk,
+        ram_avail_mb: parse_mem_available_mb(&meminfo),
+        storage_free: parse_df_free(&df),
+        uptime,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivacyCategory {
     Acr,

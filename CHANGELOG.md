@@ -2,6 +2,15 @@
 
 All notable changes to **atvtools** are documented in this file.
 
+## [5.2.0] - 2026-11-22
+
+### Added
+- **Click-to-Tap Screenshot & Live Preview:** Click anywhere on the TV screenshot in **Remote & Screen** to send `input tap x y`, or toggle **Live Preview (2.5s)** for hands-free mirroring without `scrcpy`.
+- **HDMI / TV Input Switcher & Browser Remote:** Added `TV Input` and `HDMI 1–4` buttons plus one-click **Browser Remote (:8080)** launcher in **Remote & Screen**.
+- **TV System Health Card:** Added **System Health** in **Connect** showing Android version/SDK, available RAM (`MemAvailable`), `/data` free space, and uptime.
+- **Quick App Permissions in GUI:** Added **Grant Storage** (`MANAGE_EXTERNAL_STORAGE`) and **Grant Write Settings** (`WRITE_SETTINGS`) buttons in **Apps**.
+- **Screensaver Picker:** Added custom screensaver component input (pre-filled with Aerial Views) and **Off** toggle in **Settings**.
+
 ## [5.1.0] - 2026-11-22
 
 ### Added
