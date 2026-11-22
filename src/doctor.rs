@@ -87,6 +87,9 @@ pub fn run(adb: &Adb) -> Result<String> {
         if let Ok(ota) = crate::settings::ota_state(adb) {
             let _ = writeln!(out, "ota updates    : {ota}   (atvtools settings ota --off blocks them)");
         }
+        if let Some(warn) = crate::tv_safety::check_adb_secure(adb) {
+            let _ = writeln!(out, "adb security   : WARNING - {warn}");
+        }
     }
     Ok(out)
 }

@@ -24,6 +24,7 @@ mod screen;
 mod settings;
 mod shizuku;
 mod transfer;
+mod tv_safety;
 mod uad;
 mod undo;
 mod update;
@@ -278,6 +279,37 @@ enum Cmd {
         #[command(subcommand)]
         op: UadOp,
     },
+    /// Manage Stellar (optional Shizuku-compatible privileged API manager).
+    Stellar {
+        #[command(subcommand)]
+        op: ShizukuOp,
+    },
+    /// Audit Android TV for ACR, voice, and OEM telemetry packages.
+    Privacy {
+        /// Disable the discovered ACR/telemetry packages (safe-guarded, undoable).
+        #[arg(long)]
+        disable: bool,
+        /// Skip the confirmation prompt when disabling.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Check for firmware OTA drift (re-enabled bloatware) and optionally re-apply.
+    Drift {
+        /// Preset name to compare against (defaults to all presets).
+        #[arg(long)]
+        preset: Option<String>,
+        /// Re-disable drifted packages (with brick/Wi-Fi/Home guards).
+        #[arg(long)]
+        fix: bool,
+        /// Override Home launcher guard.
+        #[arg(long)]
+        force_home: bool,
+        /// Override setupwraith Wi-Fi ownership guard.
+        #[arg(long)]
+        force_setupwraith: bool,
+    },
+    /// Set a third-party launcher package as the default HOME activity.
+    Home { package: String },
     /// Native desktop window (needs a display).
     Gui,
 }
@@ -974,16 +1006,74 @@ fn main() -> Result<()> {
         }
         Cmd::Shizuku { op } => match op {
             ShizukuOp::Install { replace } => {
-                let e = catalog::find("shizuku-fork")
-                    .ok_or_else(|| anyhow::anyhow!("shizuku-fork is missing from the catalog"))?;
-                let dest = std::env::temp_dir().join("atvtools").join(format!("{}.apk", e.name));
-                download::fetch(e.url, &dest)?;
-                apps::install_with(&adb, &[dest], replace)?;
+                download::install_catalog_with(&adb, "shizuku-fork", replace)?;
             }
             ShizukuOp::Start => shizuku::start(&adb)?,
             ShizukuOp::Stop => shizuku::stop(&adb)?,
             ShizukuOp::Status => shizuku::status(&adb)?,
         },
+        Cmd::Stellar { op } => match op {
+            ShizukuOp::Install { replace } => {
+                download::install_catalog_with(&adb, "stellar", replace)?;
+            }
+            ShizukuOp::Start => shizuku::start_for(&adb, shizuku::Provider::Stellar)?,
+            ShizukuOp::Stop => shizuku::stop_for(&adb, shizuku::Provider::Stellar)?,
+            ShizukuOp::Status => shizuku::status_for(&adb, shizuku::Provider::Stellar)?,
+        },
+        Cmd::Privacy { disable, yes } => {
+            let findings = tv_safety::audit_privacy(&adb)?;
+            if findings.is_empty() {
+                println!("no known ACR, voice, or telemetry packages found on this TV");
+                return Ok(());
+            }
+            for f in &findings {
+                let state = if f.enabled { "enabled" } else { "disabled" };
+                println!("[{:<9}] {:<8} {} — {}", f.category.label(), state, f.package, f.note);
+            }
+            if disable {
+                let enabled: Vec<String> = findings
+                    .into_iter()
+                    .filter(|f| f.enabled)
+                    .map(|f| f.package)
+                    .collect();
+                if enabled.is_empty() {
+                    println!("all flagged privacy packages are already disabled");
+                    return Ok(());
+                }
+                if !yes && !confirm(&format!("disable {} privacy/telemetry packages?", enabled.len()))? {
+                    println!("aborted");
+                    return Ok(());
+                }
+                apps::set_enabled(&adb, &enabled, false)?;
+                journals(&adb, "privacy audit", &enabled);
+            }
+        }
+        Cmd::Drift { preset, fix, force_home, force_setupwraith } => {
+            let expected = tv_safety::preset_packages(preset.as_deref())?;
+            let opts = tv_safety::SafetyOptions { force_setupwraith, force_home };
+            if fix {
+                let (guard, report) = tv_safety::fix_drift(&adb, &expected, &opts)?;
+                if report.is_clean() {
+                    println!("no drift: all expected packages are still disabled");
+                } else {
+                    println!("re-disabled {} drifted package(s)", guard.allowed.len());
+                }
+            } else {
+                let report = tv_safety::check_drift(&adb, &expected)?;
+                if report.is_clean() {
+                    println!("no drift: all expected packages are still disabled");
+                } else {
+                    println!("drifted (re-enabled) packages:");
+                    for p in &report.reenabled {
+                        println!("  {p}");
+                    }
+                    println!("run with --fix to re-disable safely");
+                }
+            }
+        }
+        Cmd::Home { package } => {
+            println!("{}", tv_safety::set_home_activity(&adb, &package)?);
+        }
         Cmd::Preset { op } => match op {
             PresetOp::List => {
                 for p in debloat::PRESETS {

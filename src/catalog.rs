@@ -21,9 +21,11 @@ pub const CATALOG: &[Entry] = &[
     Entry { name: "aptoide", url: "https://pool.apk.aptoide.com/appstvcommunity/cm-aptoidetv-pt-522-69192608-2378269a780b89bbabeef71385194a14.apk", note: "Aptoide TV" },
     Entry { name: "flauncher", url: "https://gitlab.com/flauncher/flauncher/-/releases/0.18.0/downloads/flauncher-0.18.0.apk", note: "FLauncher 0.18.0" },
     Entry { name: "projectivy", url: "https://github.com/spocky/miproja1/releases/download/4.72/ProjectivyLauncher-4.72-c97-xda-release.apk", note: "Projectivy Launcher 4.72, XDA release (spocky/miproja1)" },
+    Entry { name: "tvos-launcher", url: "gh:techgenius1/tvOS-Launcher:stable", note: "tvOS Launcher - Apple TV style home screen (techgenius1/tvOS-Launcher)" },
     Entry { name: "adguard-tv", url: "https://agrd.io/tvapk", note: "AdGuard for Android TV" },
     Entry { name: "launch-on-boot", url: "https://f-droid.org/repo/news.androidtv.launchonboot_12.apk", note: "Launch on Boot" },
     Entry { name: "shizuku-fork", url: "https://github.com/symbuzzer/fork-Shizuku/releases/download/v1.4.1/Shizuku-fork.apk", note: "fork-Shizuku 1.4.1 - Shizuku variant; activate with: atvtools shizuku start" },
+    Entry { name: "stellar", url: "gh:roro2239/Stellar:stable", note: "Stellar - Shizuku-compatible privileged API manager (roro2239/Stellar)" },
     Entry { name: "nuvio", url: "https://github.com/NuvioMedia/NuvioTV/releases/download/1.0.0/app-full-arm64-v8a-release.apk", note: "Nuvio TV 1.0.0 - arm64-v8a build (NuvioMedia/NuvioTV)" },
     Entry { name: "nuvio-x86", url: "https://github.com/NuvioMedia/NuvioTV/releases/download/1.0.0/app-full-x86_64-release.apk", note: "Nuvio TV 1.0.0 - x86_64 build (Intel boxes, emulators)" },
     Entry { name: "ftvlaunchx", url: "https://github.com/codefaktor/FTVLaunchX/releases/download/v1.0.1/FTVLaunchX-1.0.1.apk", note: "FTVLaunchX" },
@@ -40,9 +42,11 @@ pub const PACKAGES: &[(&str, &[&str])] = &[
     ("aptoide", &["cm.aptoidetv.pt", "cm.aptoide.partners"]),
     ("flauncher", &["de.cyberflohr.flauncher", "com.example.flauncher"]),
     ("projectivy", &["com.spocky.projengmenu"]),
+    ("tvos-launcher", &["com.techgenius.tvoslauncher"]),
     ("adguard-tv", &["com.adguard.androidtv"]),
     ("launch-on-boot", &["news.androidtv.launchonboot"]),
     ("shizuku-fork", &["moe.shizuku.privileged.api"]),
+    ("stellar", &["roro.stellar.manager"]),
     ("nuvio", &["com.nuvio.app"]),
     ("nuvio-x86", &["com.nuvio.app"]),
     ("ftvlaunchx", &["com.codefaktor.ftvlaunchx"]),
@@ -134,6 +138,9 @@ pub fn rank_asset(asset: &str, abis: &[&str]) -> Option<usize> {
     }
     if asset.contains("universal") {
         Some(abis.len() + 1)
+    } else if asset.ends_with(".apk") {
+        // Fallback for releases that ship a single universal APK without "universal" in its name.
+        Some(abis.len() + 2)
     } else {
         None
     }

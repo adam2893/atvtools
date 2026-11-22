@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'tag to create, e.g. v4.1.0'
+        description: 'tag to create, e.g. v5.0.0'
         required: true
         type: string
 
@@ -54,12 +54,34 @@ jobs:
         run: |
           cargo build --release --target aarch64-apple-darwin
           cargo build --release --target x86_64-apple-darwin
-          mkdir -p dist
+          mkdir -p dist/atvtools.app/Contents/MacOS dist/atvtools.app/Contents/Resources
           lipo -create -output dist/atvtools \
             target/aarch64-apple-darwin/release/atvtools \
             target/x86_64-apple-darwin/release/atvtools
+          cp dist/atvtools dist/atvtools.app/Contents/MacOS/atvtools-bin
+          cat > dist/atvtools.app/Contents/MacOS/atvtools << 'EOF'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          exec "$DIR/atvtools-bin" gui
+          EOF
+          chmod +x dist/atvtools.app/Contents/MacOS/atvtools
+          cat > dist/atvtools.app/Contents/Info.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>atvtools</string>
+            <key>CFBundleIdentifier</key><string>com.adam2893.atvtools</string>
+            <key>CFBundleName</key><string>atvtools</string>
+            <key>CFBundleVersion</key><string>${VERSION#v}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION#v}</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
           cp README.md dist/
-          tar -czf "atvtools-${VERSION}-macos-universal.tar.gz" -C dist atvtools README.md
+          tar -czf "atvtools-${VERSION}-macos-universal.tar.gz" -C dist atvtools atvtools.app README.md
 
       - name: build (Linux)
         if: matrix.os == 'ubuntu-22.04'
@@ -79,8 +101,9 @@ jobs:
           cargo build --release
           mkdir -p dist
           cp target/release/atvtools.exe README.md dist/
+          printf '@echo off\r\nstart "" "%%~dp0atvtools.exe" gui\r\n' > dist/atvtools-gui.bat
           cd dist
-          powershell -NoProfile -Command 'Compress-Archive -Path atvtools.exe, README.md -DestinationPath "../atvtools-$env:VERSION-x86_64-pc-windows-msvc.zip"'
+          powershell -NoProfile -Command 'Compress-Archive -Path atvtools.exe, atvtools-gui.bat, README.md -DestinationPath "../atvtools-$env:VERSION-x86_64-pc-windows-msvc.zip"'
 
       - uses: actions/upload-artifact@v4
         with:

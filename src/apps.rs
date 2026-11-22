@@ -106,7 +106,29 @@ pub fn uninstall(adb: &Adb, pkgs: &[String]) -> Result<()> {
 }
 
 pub fn set_enabled(adb: &Adb, pkgs: &[String], enable: bool) -> Result<()> {
-    for p in pkgs {
+    set_enabled_with_options(adb, pkgs, enable, &crate::tv_safety::SafetyOptions::default())
+}
+
+pub fn set_enabled_with_options(
+    adb: &Adb,
+    pkgs: &[String],
+    enable: bool,
+    opts: &crate::tv_safety::SafetyOptions,
+) -> Result<()> {
+    let target_pkgs = if !enable {
+        let guard = crate::tv_safety::guard_packages(adb, pkgs, opts);
+        for w in &guard.warnings {
+            eprintln!("warning: {w}");
+        }
+        for (pkg, reason) in &guard.blocked {
+            println!("{pkg}: skipped ({reason})");
+        }
+        guard.allowed
+    } else {
+        pkgs.to_vec()
+    };
+
+    for p in &target_pkgs {
         let cmd = if enable {
             format!("pm enable {p}")
         } else {
@@ -312,6 +334,9 @@ pub fn info(adb: &Adb, package: &str) -> Result<String> {
 
 /// Launch an installed user app through its launcher category.
 pub fn launch(adb: &Adb, package: &str) -> Result<()> {
+    if crate::tv_safety::is_factory_package(package) {
+        bail!("refusing to launch {package}: opening factory/production menu packages can lock CVTE/MediaTek boards into factory mode");
+    }
     let out = adb.try_out(&["shell", &format!("monkey -p {package} -c android.intent.category.LAUNCHER 1")]);
     if out.contains("No activities found") {
         bail!("{package} has no launcher activity");

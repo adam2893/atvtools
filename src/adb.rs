@@ -1,9 +1,104 @@
-//! Thin wrapper around the platform adb binary. No shell is used, so every
-//! argument reaches adb verbatim (the original batch script had to fight
-//! cmd.exe quoting; here that whole class of bug is gone).
+//! Typed wrapper around the platform `adb` binary, incorporating UAD-ng's
+//! command-builder and OEM-friendly error patterns while keeping `atvtools`'s
+//! zero-shell-quoting safety.
 
 use anyhow::{bail, Context, Result};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Convert ADB output bytes to a trimmed UTF-8 string without panicking on
+/// non-UTF-8 OEM output.
+pub fn to_trimmed_utf8(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim_end().to_string()
+}
+
+/// Validated Android package identifier (rejects empty strings, whitespace,
+/// and shell metacharacters).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PackageId(String);
+
+impl PackageId {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let s = raw.trim();
+        if is_valid_package_name(s) {
+            Ok(Self(s.to_string()))
+        } else {
+            bail!("invalid Android package name: '{s}'")
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PackageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Returns `true` when `s` matches `[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+`
+/// (or bare `android`).
+pub fn is_valid_package_name(s: &str) -> bool {
+    if s == "android" {
+        return true;
+    }
+    let mut parts = s.split('.');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() {
+        return false;
+    }
+    let first_ok = !first.is_empty()
+        && first
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        && first
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    first_ok
+        && rest.iter().all(|seg| {
+            !seg.is_empty()
+                && seg
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+}
+
+/// Android user profile reported by `pm list users`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInfo {
+    pub id: u16,
+    pub name: String,
+}
+
+impl std::fmt::Display for UserInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "user {} ({})", self.id, self.name)
+    }
+}
+
+/// Parse `pm list users` output into `UserInfo` entries.
+pub fn parse_users(raw: &str) -> Vec<UserInfo> {
+    raw.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let rest = trimmed.strip_prefix("UserInfo{")?;
+            let (id_str, after_id) = rest.split_once(':')?;
+            let id = id_str.trim().parse::<u16>().ok()?;
+            let name = after_id.split(':').next().unwrap_or("User").trim().to_string();
+            Some(UserInfo { id, name })
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Adb {
@@ -32,6 +127,54 @@ pub fn advice(text: &str) -> &'static str {
     }
 }
 
+/// Translate common OEM and Android TV ADB failure codes into actionable
+/// messages (inspired by UAD-ng's `make_friendly_error_message` + TV hints).
+pub fn friendly_error(output: &str) -> Option<String> {
+    if output.contains("DELETE_FAILED_USER_RESTRICTED") {
+        return Some(
+            "Cannot uninstall: package is restricted by OEM policy (Knox/vendor). Try disabling instead."
+                .to_string(),
+        );
+    }
+    if output.contains("NOT_INSTALLED_FOR_USER") || output.contains("not installed for") {
+        return Some("Package is not installed for the selected user profile.".to_string());
+    }
+    if output.contains("DELETE_FAILED_DEVICE_POLICY_MANAGER") {
+        return Some("Cannot modify: package is managed by Device Policy Manager (MDM).".to_string());
+    }
+    if output.contains("Shell cannot change component state for null") {
+        return Some("Invalid package: empty package name. Refresh the package list and retry.".to_string());
+    }
+    if output.contains("INSTALL_FAILED_VERIFICATION_FAILURE") {
+        return Some(
+            "TV firmware blocked APK sideloading (INSTALL_FAILED_VERIFICATION_FAILURE)."
+                .to_string(),
+        );
+    }
+    if output.contains("INSTALL_FAILED_OLDER_SDK") {
+        return Some("APK requires a newer Android version than this TV runs.".to_string());
+    }
+    if output.contains("SecurityException") {
+        return Some(
+            "Firmware refused pm command (SecurityException): this OS build locks down package changes."
+                .to_string(),
+        );
+    }
+    if output.contains("Permission denied")
+        || output.contains("INSTALL_FAILED_PERMISSION_MODEL_DOWNGRADE")
+    {
+        return Some(
+            "Permission denied: insufficient privileges (package may be protected by system)."
+                .to_string(),
+        );
+    }
+    let adv = advice(output);
+    if !adv.is_empty() {
+        return Some(adv.to_string());
+    }
+    None
+}
+
 /// One line of `adb devices -l`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Device {
@@ -40,10 +183,137 @@ pub struct Device {
     pub model: Option<String>,
 }
 
+/// Typed `adb` command builder (`ACommand` -> `ShellCommand` -> `PmCommand`).
+pub struct ACommand {
+    cmd: Command,
+    bin: String,
+    args_log: Vec<String>,
+}
+
+impl ACommand {
+    pub fn new(bin: impl Into<String>) -> Self {
+        let bin = bin.into();
+        let mut cmd = Command::new(&bin);
+        cmd.stdin(Stdio::null());
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        Self {
+            cmd,
+            bin,
+            args_log: Vec::new(),
+        }
+    }
+
+    pub fn arg(mut self, arg: &str) -> Self {
+        self.cmd.arg(arg);
+        self.args_log.push(arg.to_string());
+        self
+    }
+
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for a in args {
+            let s = a.as_ref();
+            self.cmd.arg(s);
+            self.args_log.push(s.to_string());
+        }
+        self
+    }
+
+    pub fn shell(mut self, serial: Option<&str>) -> ShellCommand {
+        if let Some(s) = serial.filter(|s| !s.trim().is_empty()) {
+            self.cmd.args(["-s", s]);
+            self.args_log.push("-s".to_string());
+            self.args_log.push(s.to_string());
+        }
+        self.cmd.arg("shell");
+        self.args_log.push("shell".to_string());
+        ShellCommand(self)
+    }
+
+    pub fn run(mut self) -> Result<String> {
+        let o = self
+            .cmd
+            .output()
+            .with_context(|| format!("running {} {}", self.bin, self.args_log.join(" ")))?;
+        let stdout = to_trimmed_utf8(&o.stdout);
+        let stderr = to_trimmed_utf8(&o.stderr);
+        if !o.status.success() {
+            let detail = format!("{stdout} {stderr}").trim().to_string();
+            let tip = friendly_error(&detail).unwrap_or_default();
+            let suffix = if tip.is_empty() {
+                String::new()
+            } else {
+                format!("\n  -> {tip}")
+            };
+            bail!("adb {} failed: {detail}{suffix}", self.args_log.join(" "));
+        }
+        Ok(stdout)
+    }
+}
+
+/// Typed `adb [-s <serial>] shell` builder.
+pub struct ShellCommand(ACommand);
+
+impl ShellCommand {
+    pub fn raw(self, command: &str) -> Result<String> {
+        self.0.arg(command).run()
+    }
+
+    pub fn pm(self) -> PmCommand {
+        PmCommand(self.0)
+    }
+}
+
+/// Typed `pm` sub-command builder enforcing validated `PackageId`s.
+pub struct PmCommand(ACommand);
+
+impl PmCommand {
+    pub fn enable(self, pkg: &PackageId) -> Result<String> {
+        self.0.arg(&format!("pm enable {}", pkg.as_str())).run()
+    }
+
+    pub fn disable_user(self, pkg: &PackageId, user_id: u16) -> Result<String> {
+        self.0
+            .arg(&format!("pm disable-user --user {user_id} {}", pkg.as_str()))
+            .run()
+    }
+
+    pub fn uninstall_user(self, pkg: &PackageId, user_id: u16) -> Result<String> {
+        self.0
+            .arg(&format!("pm uninstall --user {user_id} {}", pkg.as_str()))
+            .run()
+    }
+
+    pub fn install_existing(self, pkg: &PackageId, user_id: u16) -> Result<String> {
+        self.0
+            .arg(&format!("cmd package install-existing --user {user_id} {}", pkg.as_str()))
+            .run()
+    }
+
+    pub fn list_users(self) -> Result<Vec<UserInfo>> {
+        let out = self.0.arg("pm list users").run()?;
+        Ok(parse_users(&out))
+    }
+}
+
 impl Adb {
     pub fn new(serial: Option<String>) -> Self {
         let bin = std::env::var("ADB").unwrap_or_else(|_| "adb".to_string());
         Self { serial, bin }
+    }
+
+    /// Start a typed `ACommand` using this `Adb`'s binary.
+    pub fn cmd(&self) -> ACommand {
+        ACommand::new(&self.bin)
+    }
+
+    /// Start a typed `PmCommand` targeting this `Adb`'s serial.
+    pub fn pm(&self) -> PmCommand {
+        self.cmd().shell(self.serial.as_deref()).pm()
     }
 
     pub fn args_for(&self, args: &[&str]) -> Vec<String> {
@@ -60,9 +330,11 @@ impl Adb {
     /// the failure text adb printed instead of losing it to an early error.
     pub fn output(&self, args: &[&str]) -> Result<(bool, String, String)> {
         let argv = self.args_for(args);
-        let o = Command::new(&self.bin)
-            .args(&argv)
-            .stdin(Stdio::null())
+        let mut command = Command::new(&self.bin);
+        command.args(&argv).stdin(Stdio::null());
+        #[cfg(target_os = "windows")]
+        command.creation_flags(CREATE_NO_WINDOW);
+        let o = command
             .output()
             .with_context(|| format!("running {} {}", self.bin, argv.join(" ")))?;
         Ok((
@@ -77,7 +349,7 @@ impl Adb {
         let (ok, stdout, stderr) = self.output(args)?;
         if !ok {
             let detail = format!("{}{}", stdout.trim(), stderr.trim());
-            let tip = advice(&detail);
+            let tip = friendly_error(&detail).unwrap_or_default();
             let suffix = if tip.is_empty() { String::new() } else { format!("\n  -> {tip}") };
             bail!("adb {} failed: {}{}{suffix}", argv.join(" "), stdout.trim(), stderr.trim());
         }
@@ -105,6 +377,10 @@ impl Adb {
 
     pub fn devices(&self) -> Result<Vec<Device>> {
         Ok(parse_devices(&self.out(&["devices", "-l"])?))
+    }
+
+    pub fn users(&self) -> Result<Vec<UserInfo>> {
+        self.pm().list_users()
     }
 
     pub fn connect(&self, host: &str) -> Result<String> {
@@ -166,6 +442,32 @@ mod tests {
         assert!(advice("error: more than one device/emulator").contains("-s"));
         assert!(advice("error: device offline").contains("offline"));
         assert!(advice("error: closed").is_empty());
+    }
+
+    #[test]
+    fn oem_errors_map_to_friendly_messages() {
+        assert!(friendly_error("Failure [DELETE_FAILED_USER_RESTRICTED]").unwrap().contains("OEM policy"));
+        assert!(friendly_error("Failure [NOT_INSTALLED_FOR_USER]").unwrap().contains("not installed"));
+        assert!(friendly_error("INSTALL_FAILED_VERIFICATION_FAILURE").unwrap().contains("sideloading"));
+        assert!(friendly_error("java.lang.SecurityException").unwrap().contains("SecurityException"));
+    }
+
+    #[test]
+    fn package_id_rejects_shell_injection() {
+        assert!(PackageId::parse("com.google.android.youtube.tv").is_ok());
+        assert!(PackageId::parse("android").is_ok());
+        assert!(PackageId::parse("com.foo; rm -rf /").is_err());
+        assert!(PackageId::parse("").is_err());
+        assert!(PackageId::parse("singleword").is_err());
+    }
+
+    #[test]
+    fn parses_pm_list_users() {
+        let raw = "Users:\n\tUserInfo{0:Owner:4c13} running\n\tUserInfo{10:Work:30}\n";
+        let users = parse_users(raw);
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0], UserInfo { id: 0, name: "Owner".into() });
+        assert_eq!(users[1], UserInfo { id: 10, name: "Work".into() });
     }
 
     #[test]

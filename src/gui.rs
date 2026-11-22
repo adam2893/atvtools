@@ -1,33 +1,75 @@
-//! Native desktop window (egui) over the same functions the CLI calls.
-//!
-//! shortcut: actions run on the UI thread, so a slow adb call (pull, download,
-//! backup) freezes the window while it runs; move them to worker threads if the
-//! stutter starts to hurt.
+//! Native desktop window (egui) with non-blocking background workers,
+//! anti-slop cool-slate design system, and guided Android TV cleanup.
 
-use crate::adb::Adb;
+use crate::adb::{Adb, Device};
 use crate::apps::{self, Scope};
-use crate::{catalog, device, download, net, screen, settings, transfer, uad};
+use crate::{catalog, debloat, device, download, net, screen, settings, shizuku, transfer, tv_safety, uad, undo};
 use anyhow::Result;
-use eframe::egui;
+use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 const SHOT: &str = "atvtools-shot.png";
 const SCOPES: [&str; 3] = ["third-party", "system", "all"];
 
+// Locked design tokens: cool-slate neutral family + single blue accent.
+const BG_WINDOW: Color32 = Color32::from_rgb(15, 20, 25);
+const BG_PANEL: Color32 = Color32::from_rgb(20, 26, 33);
+const BG_CARD: Color32 = Color32::from_rgb(27, 34, 44);
+const BORDER_SUBTLE: Color32 = Color32::from_rgb(42, 52, 65);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(230, 237, 243);
+const TEXT_MUTED: Color32 = Color32::from_rgb(139, 148, 158);
+const ACCENT: Color32 = Color32::from_rgb(59, 130, 246);
+const STATUS_OK: Color32 = Color32::from_rgb(34, 197, 94);
+const STATUS_WARN: Color32 = Color32::from_rgb(245, 158, 11);
+const STATUS_ERR: Color32 = Color32::from_rgb(239, 68, 68);
+
+const RADIUS_CARD: CornerRadius = CornerRadius::same(8);
+const RADIUS_CONTROL: CornerRadius = CornerRadius::same(6);
+const RADIUS_BADGE: CornerRadius = CornerRadius::same(10);
+
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Connect,
+    Cleanup,
     Apps,
-    Files,
     Debloat,
     Settings,
-    Screen,
-    Remote,
-    Helpers,
+    RemoteScreen,
+    FilesCatalog,
 }
 
-/// Every activity line also lands in ~/.atvtools/log, one rotation deep: once the
-/// file passes MAX_LOG_BYTES it is renamed to log.1 and started fresh.
+impl Tab {
+    const ALL: [(Self, &str); 7] = [
+        (Self::Connect, "Connect"),
+        (Self::Cleanup, "TV Cleanup"),
+        (Self::Apps, "Apps"),
+        (Self::Debloat, "Debloat (UAD)"),
+        (Self::Settings, "Settings"),
+        (Self::RemoteScreen, "Remote & Screen"),
+        (Self::FilesCatalog, "Files & Catalog"),
+    ];
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum HelperChoice {
+    Shizuku,
+    Stellar,
+}
+
+enum WorkerMsg {
+    FoundHosts(Vec<String>),
+    Devices(Vec<Device>),
+    Packages(Vec<apps::PkgRow>),
+    UadHits(Vec<uad::Hit>),
+    PrivacyFindings(Vec<tv_safety::PrivacyFinding>),
+    Drift(tv_safety::DriftReport),
+    Launchers(Vec<String>),
+    Screenshot(PathBuf),
+    SetTarget(String),
+    Done(String),
+}
+
 const MAX_LOG_BYTES: u64 = 1_000_000;
 
 fn append_log(line: &str) {
@@ -49,25 +91,89 @@ fn append_log(line: &str) {
 pub fn run(serial: Option<String>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1020.0, 720.0])
-            .with_min_inner_size([780.0, 540.0])
+            .with_inner_size([1080.0, 760.0])
+            .with_min_inner_size([840.0, 580.0])
             .with_title("atvtools"),
         ..Default::default()
     };
     eframe::run_native(
         "atvtools",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(serial)) as Box<dyn eframe::App>)),
+        Box::new(move |cc| {
+            apply_theme(&cc.egui_ctx);
+            Ok(Box::new(App::new(serial)) as Box<dyn eframe::App>)
+        }),
     )
     .map_err(|e| anyhow::anyhow!("could not start the GUI: {e}"))
+}
+
+fn apply_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+    let mut v = egui::Visuals::dark();
+    v.window_fill = BG_WINDOW;
+    v.panel_fill = BG_PANEL;
+    v.extreme_bg_color = BG_WINDOW;
+    v.faint_bg_color = BG_CARD;
+    v.selection.bg_fill = ACCENT;
+    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    v.widgets.noninteractive.bg_fill = BG_CARD;
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_SUBTLE);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    v.widgets.noninteractive.corner_radius = RADIUS_CONTROL;
+    v.widgets.inactive.bg_fill = BG_CARD;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_SUBTLE);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    v.widgets.inactive.corner_radius = RADIUS_CONTROL;
+    v.widgets.hovered.bg_fill = Color32::from_rgb(36, 46, 59);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
+    v.widgets.hovered.corner_radius = RADIUS_CONTROL;
+    v.widgets.active.bg_fill = ACCENT;
+    v.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    v.widgets.active.corner_radius = RADIUS_CONTROL;
+    style.visuals = v;
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    ctx.set_style_of(egui::Theme::Dark, style);
+}
+
+fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(BG_CARD)
+        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+        .corner_radius(RADIUS_CARD)
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, add_contents);
+}
+
+fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
+    egui::Frame::new()
+        .fill(color.linear_multiply(0.18))
+        .stroke(Stroke::new(1.0, color.linear_multiply(0.6)))
+        .corner_radius(RADIUS_BADGE)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).color(color).small().strong());
+        });
+}
+
+fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(label).color(Color32::WHITE).strong())
+            .fill(ACCENT)
+            .corner_radius(RADIUS_CONTROL),
+    )
 }
 
 struct App {
     adb: Adb,
     serial_input: String,
+    pair_addr: String,
+    pair_code: String,
     tab: Tab,
     log: Vec<String>,
     found: Vec<String>,
+    attached: Vec<Device>,
     packages: Vec<apps::PkgRow>,
     scope: usize,
     filter: String,
@@ -75,6 +181,10 @@ struct App {
     hits: Vec<uad::Hit>,
     level: usize,
     confirm: bool,
+    privacy_findings: Vec<tv_safety::PrivacyFinding>,
+    drift_report: Option<tv_safety::DriftReport>,
+    launchers: Vec<String>,
+    helper_choice: HelperChoice,
     text_in: String,
     url_in: String,
     dpi: String,
@@ -82,21 +192,27 @@ struct App {
     seconds: String,
     remote_path: String,
     local_path: String,
-    /// Attached devices, refreshed by the Connect tab; picking one retargets the app.
-    attached: Vec<crate::adb::Device>,
-    /// Decoded screenshot, shown inline under the Screen tab.
     shot: Option<egui::TextureHandle>,
+    tx: Sender<WorkerMsg>,
+    rx: Receiver<WorkerMsg>,
+    in_flight: usize,
+    busy_label: String,
+    show_log: bool,
 }
 
 impl App {
     fn new(serial: Option<String>) -> Self {
         let serial_input = serial.clone().unwrap_or_default();
+        let (tx, rx) = mpsc::channel();
         let mut app = App {
             adb: Adb::new(serial),
             serial_input,
+            pair_addr: String::new(),
+            pair_code: String::new(),
             tab: Tab::Connect,
             log: Vec::new(),
             found: Vec::new(),
+            attached: Vec::new(),
             packages: Vec::new(),
             scope: 0,
             filter: String::new(),
@@ -104,6 +220,10 @@ impl App {
             hits: Vec::new(),
             level: 0,
             confirm: false,
+            privacy_findings: Vec::new(),
+            drift_report: None,
+            launchers: Vec::new(),
+            helper_choice: HelperChoice::Shizuku,
             text_in: String::new(),
             url_in: String::new(),
             dpi: String::new(),
@@ -111,10 +231,14 @@ impl App {
             seconds: "20".to_string(),
             remote_path: transfer::DOWNLOADS.to_string(),
             local_path: String::new(),
-            attached: Vec::new(),
             shot: None,
+            tx,
+            rx,
+            in_flight: 0,
+            busy_label: String::new(),
+            show_log: true,
         };
-        app.say("atvtools GUI. Connect to a TV on the first tab, then pick a tab above.");
+        app.say("Ready. Connect to a TV in the Connect tab or select an attached device.");
         app
     }
 
@@ -137,11 +261,54 @@ impl App {
         }
     }
 
-    fn act(&mut self, what: &str, f: impl FnOnce(&Adb) -> Result<String>) {
-        let res = f(&self.adb);
-        match res {
-            Ok(v) => self.say(format!("{what}: {v}")),
-            Err(e) => self.say(format!("{what}: {e}")),
+    fn spawn(
+        &mut self,
+        ctx: &egui::Context,
+        label: impl Into<String>,
+        work: impl FnOnce(Adb, Sender<WorkerMsg>) -> Result<String> + Send + 'static,
+    ) {
+        let label = label.into();
+        self.in_flight += 1;
+        self.busy_label = label.clone();
+        let adb = self.adb.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match work(adb, tx.clone()) {
+                Ok(v) => WorkerMsg::Done(format!("{label}: {v}")),
+                Err(e) => WorkerMsg::Done(format!("{label}: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    fn drain_worker(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                WorkerMsg::FoundHosts(hosts) => self.found = hosts,
+                WorkerMsg::Devices(devs) => self.attached = devs,
+                WorkerMsg::Packages(rows) => {
+                    self.packages = rows;
+                    self.ticked.clear();
+                }
+                WorkerMsg::UadHits(hits) => self.hits = hits,
+                WorkerMsg::PrivacyFindings(f) => self.privacy_findings = f,
+                WorkerMsg::Drift(d) => self.drift_report = Some(d),
+                WorkerMsg::Launchers(l) => self.launchers = l,
+                WorkerMsg::Screenshot(path) => self.preview(&path, ctx),
+                WorkerMsg::SetTarget(serial) => {
+                    self.serial_input = serial.clone();
+                    self.adb = Adb::new(if serial.is_empty() { None } else { Some(serial) });
+                }
+                WorkerMsg::Done(line) => {
+                    self.in_flight = self.in_flight.saturating_sub(1);
+                    if self.in_flight == 0 {
+                        self.busy_label.clear();
+                    }
+                    self.say(line);
+                }
+            }
         }
     }
 
@@ -157,162 +324,371 @@ impl App {
         }
     }
 
-    fn status_line(&self, ui: &mut egui::Ui) {
-        let target = if self.serial_input.trim().is_empty() {
-            "adb default".to_string()
-        } else {
-            self.serial_input.trim().to_string()
-        };
-        ui.label(egui::RichText::new(format!("target: {target}    adb: {}", self.adb.bin)).small());
-    }
-
-    fn connect_tab(&mut self, ui: &mut egui::Ui) {
+    fn connect_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("Connect");
-        self.status_line(ui);
-        ui.horizontal(|ui| {
-            ui.label("TV address (host:port; empty = adb default)");
-            ui.add(egui::TextEdit::singleline(&mut self.serial_input).desired_width(220.0));
-            if ui.button("use it").clicked() {
-                let s = self.serial_input.trim().to_string();
-                self.adb = Adb::new(if s.is_empty() { None } else { Some(s.clone()) });
-                self.say(format!("target set to {}", if s.is_empty() { "adb default".to_string() } else { s }));
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui.button("scan the network").clicked() {
-                let hosts = net::candidates(&self.adb);
-                let answers = net::probe(&self.adb, &hosts);
-                self.say(format!(
-                    "scanned {} neighbours, {} answered on {}",
-                    hosts.len(),
-                    answers.len(),
-                    net::ADB_PORT
-                ));
-                self.found = answers;
-            }
-            if ui.button("list devices").clicked() {
-                match self.adb.devices() {
-                    Ok(d) => {
-                        self.say(format!("{} device(s) attached", d.len()));
-                        self.attached = d;
+        ui.label(RichText::new("Discover your Android TV on the local network or pair with Wireless Debugging.").color(TEXT_MUTED));
+        ui.add_space(6.0);
+
+        card(ui, |ui| {
+            ui.strong("Target Device");
+            ui.horizontal(|ui| {
+                ui.label("TV address (host:port)");
+                ui.add(egui::TextEdit::singleline(&mut self.serial_input).desired_width(220.0).hint_text("192.168.1.50:5555"));
+                if primary_button(ui, "Connect").clicked() {
+                    let s = self.serial_input.trim().to_string();
+                    if s.is_empty() {
+                        self.adb = Adb::new(None);
+                        self.say("Target set to adb default");
+                    } else {
+                        self.spawn(ctx, "connect", move |adb, tx| {
+                            let name = crate::connect_to(&adb, &s)?;
+                            let _ = tx.send(WorkerMsg::SetTarget(s));
+                            Ok(name)
+                        });
                     }
-                    Err(e) => self.say(format!("devices: {e}")),
                 }
-            }
+                if ui.button("Scan Network").clicked() {
+                    self.spawn(ctx, "scan", |adb, tx| {
+                        let hosts = net::candidates(&adb);
+                        let answers = net::probe(&adb, &hosts);
+                        let count = answers.len();
+                        let _ = tx.send(WorkerMsg::FoundHosts(answers));
+                        Ok(format!("scanned {} hosts, {count} answered on {}", hosts.len(), net::ADB_PORT))
+                    });
+                }
+                if ui.button("Refresh Devices").clicked() {
+                    self.spawn(ctx, "devices", |adb, tx| {
+                        let d = adb.devices()?;
+                        let count = d.len();
+                        let _ = tx.send(WorkerMsg::Devices(d));
+                        Ok(format!("{count} attached"))
+                    });
+                }
+            });
         });
-        let mut pick: Option<String> = None;
-        for host in &self.found {
+
+        ui.add_space(6.0);
+        card(ui, |ui| {
+            ui.strong("Wireless Debugging Pairing (Android 11+)");
             ui.horizontal(|ui| {
-                ui.monospace(host);
-                if ui.button("connect").clicked() {
-                    pick = Some(host.clone());
+                ui.label("Pairing host:port");
+                ui.add(egui::TextEdit::singleline(&mut self.pair_addr).desired_width(180.0).hint_text("192.168.1.50:37123"));
+                ui.label("6-digit code");
+                ui.add(egui::TextEdit::singleline(&mut self.pair_code).desired_width(90.0).hint_text("123456"));
+                if ui.button("Pair").clicked() {
+                    let addr = self.pair_addr.trim().to_string();
+                    let code = self.pair_code.trim().to_string();
+                    self.spawn(ctx, "pair", move |adb, _| adb.pair(&addr, &code));
                 }
             });
-        }
-        let mut use_this: Option<String> = None;
-        for d in &self.attached {
-            ui.horizontal(|ui| {
-                ui.monospace(format!("{:<24} {:<16} {}", d.serial, d.model.as_deref().unwrap_or("-"), d.state));
-                if ui.small_button("use").clicked() {
-                    use_this = Some(d.serial.clone());
+        });
+
+        ui.add_space(6.0);
+        if !self.found.is_empty() || !self.attached.is_empty() {
+            card(ui, |ui| {
+                ui.strong("Discovered & Attached TVs");
+                let mut pick: Option<String> = None;
+                for host in &self.found {
+                    ui.horizontal(|ui| {
+                        ui.monospace(host);
+                        if ui.small_button("Connect").clicked() {
+                            pick = Some(host.clone());
+                        }
+                    });
+                }
+                if let Some(host) = pick {
+                    self.spawn(ctx, "connect", move |adb, tx| {
+                        let name = crate::connect_to(&adb, &host)?;
+                        let _ = tx.send(WorkerMsg::SetTarget(host));
+                        Ok(name)
+                    });
+                }
+                let mut use_this: Option<String> = None;
+                for d in &self.attached {
+                    ui.horizontal(|ui| {
+                        let color = if d.state == "device" { STATUS_OK } else { STATUS_WARN };
+                        badge(ui, &d.state, color);
+                        ui.monospace(&d.serial);
+                        ui.label(RichText::new(d.model.as_deref().unwrap_or("unknown model")).color(TEXT_MUTED));
+                        if ui.small_button("Use").clicked() {
+                            use_this = Some(d.serial.clone());
+                        }
+                    });
+                }
+                if let Some(serial) = use_this {
+                    self.serial_input = serial.clone();
+                    self.adb = Adb::new(Some(serial.clone()));
+                    self.say(format!("Target set to {serial}"));
                 }
             });
+        } else {
+            card(ui, |ui| {
+                ui.label(RichText::new("No devices listed yet. Click 'Scan Network' or 'Refresh Devices' above.").color(TEXT_MUTED));
+            });
         }
-        if let Some(serial) = use_this {
-            self.serial_input = serial.clone();
-            self.adb = Adb::new(Some(serial.clone()));
-            self.say(format!("target set to {serial}"));
-        }
-        if let Some(host) = pick {
-            let res = crate::connect_to(&self.adb, &host);
-            match res {
-                Ok(name) => {
-                    self.serial_input = host.clone();
-                    self.adb = Adb::new(Some(host));
-                    self.say(name);
-                }
-                Err(e) => self.say(format!("connect: {e}")),
-            }
-        }
-        ui.separator();
-        ui.label("Tips: enable network debugging on the TV, accept the Allow debugging? dialog, and keep both on the same network.");
-        ui.label("No adb? brew install --cask android-platform-tools  (macOS) or your distro package.");
     }
 
-    fn apps_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Apps");
-        ui.horizontal(|ui| {
-            ui.label("scope");
-            egui::ComboBox::from_id_salt("scope")
-                .selected_text(SCOPES[self.scope])
-                .show_ui(ui, |ui| {
-                    for (i, name) in SCOPES.iter().enumerate() {
-                        ui.selectable_value(&mut self.scope, i, *name);
+    fn cleanup_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("TV Cleanup");
+        ui.label(RichText::new("Safe-guarded Android TV cleanup with brick protection, Wi-Fi ownership checks, and undo.").color(TEXT_MUTED));
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // Step 1: Privacy & ACR Audit
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("1. Privacy, ACR & Telemetry Audit");
+                    if primary_button(ui, "Scan TV").clicked() {
+                        self.spawn(ctx, "privacy audit", |adb, tx| {
+                            let f = tv_safety::audit_privacy(&adb)?;
+                            let count = f.len();
+                            let _ = tx.send(WorkerMsg::PrivacyFindings(f));
+                            Ok(format!("{count} known privacy/telemetry package(s) found"))
+                        });
+                    }
+                    let enabled_privacy: Vec<String> = self
+                        .privacy_findings
+                        .iter()
+                        .filter(|f| f.enabled)
+                        .map(|f| f.package.clone())
+                        .collect();
+                    if ui
+                        .add_enabled(!enabled_privacy.is_empty(), egui::Button::new(format!("Disable {} Flagged", enabled_privacy.len())))
+                        .clicked()
+                    {
+                        self.spawn(ctx, "privacy disable", move |adb, _| {
+                            apps::set_enabled(&adb, &enabled_privacy, false)?;
+                            let _ = undo::note("privacy-audit", adb.serial.as_deref(), &enabled_privacy);
+                            Ok(format!("disabled {} package(s) (undo saved)", enabled_privacy.len()))
+                        });
                     }
                 });
-            if ui.button("reload").clicked() {
-                let rows = apps::list_rows(&self.adb, self.scope(), true, true);
-                match rows {
-                    Ok(r) => {
-                        self.say(format!("{} packages listed", r.len()));
-                        self.packages = r;
-                        self.ticked.clear();
+                if self.privacy_findings.is_empty() {
+                    ui.label(RichText::new("Run 'Scan TV' to detect Inscape/Samba ACR, voice assistants, and OEM telemetry.").color(TEXT_MUTED).small());
+                } else {
+                    for f in &self.privacy_findings {
+                        ui.horizontal(|ui| {
+                            badge(ui, f.category.label(), if f.enabled { STATUS_WARN } else { STATUS_OK });
+                            ui.monospace(&f.package);
+                            ui.label(RichText::new(if f.enabled { "enabled" } else { "disabled" }).color(TEXT_MUTED).small());
+                        });
+                        ui.label(RichText::new(&f.note).color(TEXT_MUTED).small());
                     }
-                    Err(e) => self.say(format!("apps: {e}")),
                 }
-            }
-            ui.label("filter");
-            ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(160.0));
+            });
+
+            ui.add_space(8.0);
+
+            // Step 2: Presets, Drift Check & Undo
+            card(ui, |ui| {
+                ui.strong("2. Ad-Free Presets, OTA Drift & Undo");
+                ui.horizontal_wrapped(|ui| {
+                    for preset in debloat::PRESETS {
+                        if ui.button(format!("Apply {}", preset.title)).clicked() {
+                            let pkgs: Vec<String> = preset.packages.iter().map(|s| (*s).to_string()).collect();
+                            let title = preset.title.to_string();
+                            self.spawn(ctx, format!("preset {title}"), move |adb, _| {
+                                apps::set_enabled(&adb, &pkgs, false)?;
+                                let _ = undo::note(&format!("preset {title}"), adb.serial.as_deref(), &pkgs);
+                                Ok(format!("applied {title} (safe-guarded)"))
+                            });
+                        }
+                    }
+                    if ui.button("Check OTA Drift").clicked() {
+                        self.spawn(ctx, "drift check", |adb, tx| {
+                            let expected = tv_safety::preset_packages(None)?;
+                            let report = tv_safety::check_drift(&adb, &expected)?;
+                            let n = report.reenabled.len();
+                            let _ = tx.send(WorkerMsg::Drift(report));
+                            Ok(if n == 0 { "no drift detected".into() } else { format!("{n} package(s) re-enabled by OTA") })
+                        });
+                    }
+                    if ui.button("Fix Drift").clicked() {
+                        self.spawn(ctx, "drift fix", |adb, _| {
+                            let expected = tv_safety::preset_packages(None)?;
+                            let (guard, _) = tv_safety::fix_drift(&adb, &expected, &tv_safety::SafetyOptions::default())?;
+                            Ok(format!("re-disabled {} drifted package(s)", guard.allowed.len()))
+                        });
+                    }
+                    if ui.button("Undo Last Batch").clicked() {
+                        self.spawn(ctx, "undo", |adb, _| {
+                            let Some(rec) = undo::last(None) else {
+                                return Ok("no undo entries found".into());
+                            };
+                            apps::set_enabled(&adb, &rec.packages, true)?;
+                            undo::retire(&rec.stamp);
+                            Ok(format!("re-enabled {} package(s) from '{}'", rec.packages.len(), rec.what))
+                        });
+                    }
+                });
+                if let Some(d) = &self.drift_report {
+                    if d.is_clean() {
+                        badge(ui, "In sync: no OTA drift", STATUS_OK);
+                    } else {
+                        badge(ui, &format!("{} drifted package(s)", d.reenabled.len()), STATUS_WARN);
+                        for p in &d.reenabled {
+                            ui.monospace(p);
+                        }
+                    }
+                }
+            });
+
+            ui.add_space(8.0);
+
+            // Step 3: Launcher & Shizuku / Stellar
+            card(ui, |ui| {
+                ui.strong("3. Custom Launcher & Privileged Helper (Shizuku / Stellar)");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Optional launchers:");
+                    for (cat, label) in [
+                        ("tvos-launcher", "Install tvOS Launcher"),
+                        ("flauncher", "Install FLauncher"),
+                        ("projectivy", "Install Projectivy"),
+                    ] {
+                        if ui.button(label).clicked() {
+                            let name = cat.to_string();
+                            self.spawn(ctx, format!("install {name}"), move |adb, _| {
+                                download::install_catalog_with(&adb, &name, false)?;
+                                Ok(format!("installed {name}"))
+                            });
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Detect Launchers").clicked() {
+                        self.spawn(ctx, "launchers", |adb, tx| {
+                            let l = tv_safety::query_home_launchers(&adb)?;
+                            let n = l.len();
+                            let _ = tx.send(WorkerMsg::Launchers(l));
+                            Ok(format!("{n} launcher(s) found"))
+                        });
+                    }
+                    for comp in self.launchers.clone() {
+                        let pkg = comp.split('/').next().unwrap_or(&comp).to_string();
+                        if ui.small_button(format!("Set Home: {pkg}")).clicked() {
+                            self.spawn(ctx, "set home", move |adb, _| tv_safety::set_home_activity(&adb, &pkg));
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Privileged helper:");
+                    ui.selectable_value(&mut self.helper_choice, HelperChoice::Shizuku, "fork-Shizuku");
+                    ui.selectable_value(&mut self.helper_choice, HelperChoice::Stellar, "Stellar (optional)");
+                    let prov = match self.helper_choice {
+                        HelperChoice::Shizuku => shizuku::Provider::Shizuku,
+                        HelperChoice::Stellar => shizuku::Provider::Stellar,
+                    };
+                    if ui.button("Install").clicked() {
+                        self.spawn(ctx, format!("install {}", prov.label()), move |adb, _| {
+                            download::install_catalog_with(&adb, prov.catalog_name(), true)?;
+                            Ok(format!("installed {}", prov.catalog_name()))
+                        });
+                    }
+                    if ui.button("Start").clicked() {
+                        self.spawn(ctx, format!("start {}", prov.label()), move |adb, _| {
+                            shizuku::start_for(&adb, prov)?;
+                            Ok(format!("{} start requested", prov.label()))
+                        });
+                    }
+                    if ui.button("Status").clicked() {
+                        self.spawn(ctx, format!("status {}", prov.label()), move |adb, _| {
+                            let inst = shizuku::installed_for(&adb, prov)?;
+                            let run = shizuku::running_for(&adb, prov)?;
+                            Ok(format!("installed={inst}, running={run}"))
+                        });
+                    }
+                });
+            });
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!("{} ticked", self.ticked.len()));
-            if ui.button("disable").clicked() {
-                let pkgs = std::mem::take(&mut self.ticked);
-                self.act("disable", move |adb| {
-                    apps::set_enabled(adb, &pkgs, false).map(|_| format!("disabled {}", pkgs.len()))
-                });
-            }
-            if ui.button("enable").clicked() {
-                let pkgs = std::mem::take(&mut self.ticked);
-                self.act("enable", move |adb| {
-                    apps::set_enabled(adb, &pkgs, true).map(|_| format!("enabled {}", pkgs.len()))
-                });
-            }
-            if ui.button("uninstall").clicked() {
-                let pkgs = std::mem::take(&mut self.ticked);
-                self.act("uninstall", move |adb| {
-                    apps::uninstall(adb, &pkgs).map(|_| format!("uninstalled {}", pkgs.len()))
-                });
-            }
-            if ui.button("launch").clicked() {
-                let pkgs = std::mem::take(&mut self.ticked);
-                self.act("launch", move |adb| {
-                    for p in &pkgs {
-                        apps::launch(adb, p)?;
-                    }
-                    Ok(format!("launched {}", pkgs.len()))
-                });
-            }
-            if ui.button("force stop").clicked() {
-                let pkgs = std::mem::take(&mut self.ticked);
-                self.act("stop", move |adb| {
-                    for p in &pkgs {
-                        apps::force_stop(adb, p)?;
-                    }
-                    Ok(format!("stopped {}", pkgs.len()))
-                });
-            }
-            if ui.button("info").clicked() {
-                let pkgs = std::mem::take(&mut self.ticked);
-                self.act("info", move |adb| {
-                    let mut out = String::new();
-                    for p in &pkgs {
-                        out.push_str(&apps::info(adb, p)?);
-                    }
-                    Ok(out)
-                });
-            }
+    }
+
+    fn apps_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Apps");
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Scope");
+                egui::ComboBox::from_id_salt("scope")
+                    .selected_text(SCOPES[self.scope])
+                    .show_ui(ui, |ui| {
+                        for (i, name) in SCOPES.iter().enumerate() {
+                            ui.selectable_value(&mut self.scope, i, *name);
+                        }
+                    });
+                if primary_button(ui, "Reload").clicked() {
+                    let scope = self.scope();
+                    self.spawn(ctx, "apps", move |adb, tx| {
+                        let rows = apps::list_rows(&adb, scope, true, true)?;
+                        let n = rows.len();
+                        let _ = tx.send(WorkerMsg::Packages(rows));
+                        Ok(format!("{n} packages listed"))
+                    });
+                }
+                ui.label("Filter");
+                ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(180.0).hint_text("package name..."));
+            });
+            ui.horizontal_wrapped(|ui| {
+                badge(ui, &format!("{} selected", self.ticked.len()), ACCENT);
+                let has_sel = !self.ticked.is_empty();
+                if ui.add_enabled(has_sel, egui::Button::new("Disable (Safe)")).clicked() {
+                    let pkgs = std::mem::take(&mut self.ticked);
+                    self.spawn(ctx, "disable", move |adb, _| {
+                        apps::set_enabled(&adb, &pkgs, false)?;
+                        let _ = undo::note("gui-apps", adb.serial.as_deref(), &pkgs);
+                        Ok(format!("processed {} package(s)", pkgs.len()))
+                    });
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Enable")).clicked() {
+                    let pkgs = std::mem::take(&mut self.ticked);
+                    self.spawn(ctx, "enable", move |adb, _| {
+                        apps::set_enabled(&adb, &pkgs, true)?;
+                        Ok(format!("enabled {} package(s)", pkgs.len()))
+                    });
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Uninstall (User 0)")).clicked() {
+                    let pkgs = std::mem::take(&mut self.ticked);
+                    self.spawn(ctx, "uninstall", move |adb, _| {
+                        apps::uninstall(&adb, &pkgs)?;
+                        Ok(format!("uninstalled {} package(s)", pkgs.len()))
+                    });
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Launch")).clicked() {
+                    let pkgs = std::mem::take(&mut self.ticked);
+                    self.spawn(ctx, "launch", move |adb, _| {
+                        for p in &pkgs {
+                            apps::launch(&adb, p)?;
+                        }
+                        Ok(format!("launched {}", pkgs.len()))
+                    });
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Force Stop")).clicked() {
+                    let pkgs = std::mem::take(&mut self.ticked);
+                    self.spawn(ctx, "force stop", move |adb, _| {
+                        for p in &pkgs {
+                            apps::force_stop(&adb, p)?;
+                        }
+                        Ok(format!("stopped {}", pkgs.len()))
+                    });
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Info")).clicked() {
+                    let pkgs = std::mem::take(&mut self.ticked);
+                    self.spawn(ctx, "info", move |adb, _| {
+                        let mut out = String::new();
+                        for p in &pkgs {
+                            out.push_str(&apps::info(&adb, p)?);
+                        }
+                        Ok(out)
+                    });
+                }
+            });
         });
+        ui.add_space(6.0);
+        if self.packages.is_empty() {
+            card(ui, |ui| {
+                ui.label(RichText::new("No packages loaded. Click 'Reload' above to fetch installed packages from your TV.").color(TEXT_MUTED));
+            });
+            return;
+        }
         let rows: Vec<(String, String)> = self
             .packages
             .iter()
@@ -324,264 +700,380 @@ impl App {
             })
             .map(|r| (r.package.clone(), r.installer.clone().unwrap_or_default()))
             .collect();
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for (package, installer) in rows {
-                    ui.horizontal(|ui| {
-                        let mut on = self.tick(&package);
-                        if ui.checkbox(&mut on, "").changed() {
-                            self.toggle_tick(&package);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for (package, installer) in rows {
+                ui.horizontal(|ui| {
+                    let mut on = self.tick(&package);
+                    if ui.checkbox(&mut on, "").changed() {
+                        self.toggle_tick(&package);
+                    }
+                    ui.monospace(&package);
+                    if tv_safety::is_core_package(&package) {
+                        badge(ui, "core", STATUS_ERR);
+                    }
+                    if !installer.is_empty() {
+                        ui.label(RichText::new(installer).color(TEXT_MUTED).small());
+                    }
+                });
+            }
+        });
+    }
+
+    fn debloat_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Debloat (UAD Database)");
+        ui.label(RichText::new("Powered by Universal Android Debloater lists + CleanYourTV core brick protection.").color(TEXT_MUTED));
+        ui.add_space(6.0);
+
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Scope");
+                egui::ComboBox::from_id_salt("debloat-scope")
+                    .selected_text(SCOPES[self.scope])
+                    .show_ui(ui, |ui| {
+                        for (i, name) in SCOPES.iter().enumerate() {
+                            ui.selectable_value(&mut self.scope, i, *name);
                         }
-                        ui.monospace(&package);
-                        if !installer.is_empty() {
-                            ui.label(egui::RichText::new(installer).small());
+                    });
+                ui.label("Level");
+                egui::ComboBox::from_id_salt("level")
+                    .selected_text(uad::LEVELS[self.level])
+                    .show_ui(ui, |ui| {
+                        for (i, name) in uad::LEVELS.iter().enumerate() {
+                            ui.selectable_value(&mut self.level, i, *name);
                         }
+                    });
+                if primary_button(ui, "Scan Installed").clicked() {
+                    let scope = self.scope();
+                    let level = uad::LEVELS[self.level];
+                    self.spawn(ctx, "uad scan", move |adb, tx| {
+                        let hits = uad::scan(&adb, scope, level, false)?;
+                        let n = hits.len();
+                        let _ = tx.send(WorkerMsg::UadHits(hits));
+                        Ok(format!("{n} packages flagged at '{level}'"))
+                    });
+                }
+                if ui.button("Refresh Database").clicked() {
+                    self.spawn(ctx, "uad refresh", |_, _| {
+                        let db = uad::load(true)?;
+                        Ok(format!("{} packages cached", db.len()))
                     });
                 }
             });
-    }
-
-    fn files_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Files");
-        ui.label("adb moves the bytes; no app on the TV and no open port are needed.");
-        ui.horizontal(|ui| {
-            ui.label("on the TV");
-            ui.add(egui::TextEdit::singleline(&mut self.remote_path).desired_width(280.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("on this machine");
-            ui.add(egui::TextEdit::singleline(&mut self.local_path).desired_width(280.0));
-        });
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("list TV folder").clicked() {
-                let remote = self.remote_path.clone();
-                self.act("ls", move |adb| Ok(transfer::ls(adb, &remote)?.trim().to_string()));
-            }
-            if ui.button("send to TV").clicked() {
-                let remote = self.remote_path.clone();
-                let local = PathBuf::from(self.local_path.clone());
-                self.act("push", move |adb| {
-                    transfer::push(adb, &local, &remote)?;
-                    Ok(format!("sent {}", local.display()))
-                });
-            }
-            if ui.button("copy from TV").clicked() {
-                let remote = self.remote_path.clone();
-                let local = PathBuf::from(self.local_path.clone());
-                self.act("pull", move |adb| {
-                    transfer::pull(adb, &remote, &local)?;
-                    Ok(format!("copied to {}", local.display()))
-                });
-            }
-            if ui.button("make folder").clicked() {
-                let remote = self.remote_path.clone();
-                self.act("mkdir", move |adb| {
-                    transfer::mkdir(adb, &remote)?;
-                    Ok(format!("created {remote}"))
-                });
-            }
-        });
-        ui.label(format!("sideloads land in {}", transfer::DOWNLOADS));
-    }
-
-    fn debloat_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Debloat");
-        ui.label("Levels and descriptions come from 0x192/universal-android-debloater. Nothing changes until you press disable.");
-        ui.horizontal(|ui| {
-            ui.label("scope");
-            egui::ComboBox::from_id_salt("debloat-scope")
-                .selected_text(SCOPES[self.scope])
-                .show_ui(ui, |ui| {
-                    for (i, name) in SCOPES.iter().enumerate() {
-                        ui.selectable_value(&mut self.scope, i, *name);
-                    }
-                });
-            ui.label("level");
-            egui::ComboBox::from_id_salt("level")
-                .selected_text(uad::LEVELS[self.level])
-                .show_ui(ui, |ui| {
-                    for (i, name) in uad::LEVELS.iter().enumerate() {
-                        ui.selectable_value(&mut self.level, i, *name);
-                    }
-                });
-            if ui.button("scan installed").clicked() {
-                let scope = self.scope();
-                let level = uad::LEVELS[self.level];
-                match uad::scan(&self.adb, scope, level, false) {
-                    Ok(h) => {
-                        self.say(format!("{} packages flagged as {level}", h.len()));
-                        self.hits = h;
-                    }
-                    Err(e) => self.say(format!("debloat: {e}")),
+            ui.checkbox(
+                &mut self.confirm,
+                "I understand disabled apps disappear from the launcher (Undo / Enable restores them)",
+            );
+            ui.horizontal(|ui| {
+                let n = self.hits.len();
+                let pkgs: Vec<String> = self.hits.iter().map(|h| h.package.clone()).collect();
+                if ui
+                    .add_enabled(self.confirm && n > 0, egui::Button::new(format!("Disable {n} (Safe)")))
+                    .clicked()
+                {
+                    self.spawn(ctx, "uad disable", move |adb, _| {
+                        apps::set_enabled(&adb, &pkgs, false)?;
+                        let _ = undo::note("uad-gui", adb.serial.as_deref(), &pkgs);
+                        Ok(format!("processed {} package(s)", pkgs.len()))
+                    });
                 }
-            }
-            if ui.button("refresh database").clicked() {
-                match uad::load(true) {
-                    Ok(db) => self.say(format!("database: {} packages cached", db.len())),
-                    Err(e) => self.say(format!("debloat: {e}")),
+                if ui
+                    .add_enabled(self.confirm && n > 0, egui::Button::new(format!("Re-enable {n}")))
+                    .clicked()
+                {
+                    let pkgs: Vec<String> = self.hits.iter().map(|h| h.package.clone()).collect();
+                    self.spawn(ctx, "uad enable", move |adb, _| {
+                        apps::set_enabled(&adb, &pkgs, true)?;
+                        Ok(format!("enabled {} package(s)", pkgs.len()))
+                    });
                 }
-            }
+            });
         });
-        ui.checkbox(
-            &mut self.confirm,
-            "I understand a disabled app disappears from the launcher (enable restores it)",
-        );
-        ui.horizontal(|ui| {
-            let n = self.hits.len();
-            let pkgs: Vec<String> = self.hits.iter().map(|h| h.package.clone()).collect();
-            if ui
-                .add_enabled(self.confirm && n > 0, egui::Button::new(format!("disable {n}")))
-                .clicked()
-            {
-                let pkgs = pkgs.clone();
-                self.act("disable", move |adb| {
-                    apps::set_enabled(adb, &pkgs, false).map(|_| format!("disabled {}", pkgs.len()))
-                });
-            }
-            if ui
-                .add_enabled(self.confirm && n > 0, egui::Button::new(format!("re-enable {n}")))
-                .clicked()
-            {
-                let pkgs = pkgs.clone();
-                self.act("re-enable", move |adb| {
-                    apps::set_enabled(adb, &pkgs, true).map(|_| format!("enabled {}", pkgs.len()))
-                });
-            }
-        });
-        ui.separator();
+
+        ui.add_space(6.0);
+        if self.hits.is_empty() {
+            card(ui, |ui| {
+                ui.label(RichText::new("No UAD scan results yet. Select a safety level and click 'Scan Installed'.").color(TEXT_MUTED));
+            });
+            return;
+        }
         let hits = self.hits.clone();
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for h in &hits {
-                    ui.horizontal(|ui| {
-                        ui.monospace(&h.package);
-                        ui.label(egui::RichText::new(format!("{} / {}", h.removal, h.list)).small());
-                    });
-                    if let Some(first) = h.description.lines().find(|l| !l.trim().is_empty()) {
-                        ui.label(egui::RichText::new(first).small());
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for h in &hits {
+                ui.horizontal(|ui| {
+                    let color = match h.removal.as_str() {
+                        "Recommended" => STATUS_OK,
+                        "Advanced" => ACCENT,
+                        "Expert" => STATUS_WARN,
+                        _ => STATUS_ERR,
+                    };
+                    badge(ui, &h.removal, color);
+                    ui.monospace(&h.package);
+                    ui.label(RichText::new(&h.list).color(TEXT_MUTED).small());
+                });
+                if let Some(first) = h.description.lines().find(|l| !l.trim().is_empty()) {
+                    ui.label(RichText::new(first).color(TEXT_MUTED).small());
+                }
+            }
+        });
+    }
+
+    fn settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Settings");
+        ui.add_space(4.0);
+        card(ui, |ui| {
+            ui.strong("Display & Typography");
+            ui.horizontal(|ui| {
+                ui.label("Density (DPI)");
+                ui.add(egui::TextEdit::singleline(&mut self.dpi).desired_width(70.0));
+                if ui.button("Read").clicked() {
+                    self.spawn(ctx, "density", |adb, _| settings::density(&adb));
+                }
+                if ui.button("Set").clicked() {
+                    match self.dpi.trim().parse::<u32>() {
+                        Ok(dpi) => self.spawn(ctx, "density", move |adb, _| {
+                            settings::set_density(&adb, dpi).map(|_| format!("{dpi} dpi"))
+                        }),
+                        Err(_) => self.say("density: enter a number >= 72"),
+                    }
+                }
+                if ui.button("Reset").clicked() {
+                    self.spawn(ctx, "density", |adb, _| settings::reset_density(&adb).map(|_| "reset".into()));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Font scale");
+                ui.add(egui::TextEdit::singleline(&mut self.scale).desired_width(70.0));
+                if ui.button("Read").clicked() {
+                    self.spawn(ctx, "font scale", |adb, _| settings::font_scale(&adb));
+                }
+                if ui.button("Set").clicked() {
+                    match self.scale.trim().parse::<f32>() {
+                        Ok(s) => self.spawn(ctx, "font scale", move |adb, _| {
+                            settings::set_font_scale(&adb, s).map(|_| format!("{s}"))
+                        }),
+                        Err(_) => self.say("font scale: enter 0.5 - 2.0"),
                     }
                 }
             });
-    }
-
-    fn settings_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
-        ui.horizontal(|ui| {
-            ui.label("density");
-            ui.add(egui::TextEdit::singleline(&mut self.dpi).desired_width(70.0));
-            if ui.button("read").clicked() {
-                self.act("density", |adb| settings::density(adb));
-            }
-            if ui.button("set").clicked() {
-                match self.dpi.trim().parse::<u32>() {
-                    Ok(dpi) => self.act("density", move |adb| {
-                        settings::set_density(adb, dpi).map(|_| format!("{dpi} dpi"))
-                    }),
-                    Err(_) => self.say("density: enter a number of dpi (72 or more)"),
-                }
-            }
-            if ui.button("reset").clicked() {
-                self.act("density", |adb| settings::reset_density(adb).map(|_| "reset".to_string()));
-            }
         });
-        ui.horizontal(|ui| {
-            ui.label("font scale");
-            ui.add(egui::TextEdit::singleline(&mut self.scale).desired_width(70.0));
-            if ui.button("read").clicked() {
-                self.act("font scale", |adb| settings::font_scale(adb));
-            }
-            if ui.button("set").clicked() {
-                match self.scale.trim().parse::<f32>() {
-                    Ok(s) => self.act("font scale", move |adb| {
-                        settings::set_font_scale(adb, s).map(|_| format!("{s}"))
-                    }),
-                    Err(_) => self.say("font scale: enter a number between 0.5 and 2.0"),
+        ui.add_space(6.0);
+        card(ui, |ui| {
+            ui.strong("Private DNS & OTA Updates");
+            ui.horizontal_wrapped(|ui| {
+                if primary_button(ui, "AdGuard DNS On").clicked() {
+                    self.spawn(ctx, "adblock", |adb, _| settings::adblock_on(&adb).map(|_| settings::ADGUARD_DNS.into()));
                 }
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui.button("AdGuard DNS on").clicked() {
-                self.act("adblock", |adb| settings::adblock_on(adb).map(|_| settings::ADGUARD_DNS.to_string()));
-            }
-            if ui.button("AdGuard DNS off").clicked() {
-                self.act("adblock", |adb| settings::adblock_off(adb).map(|_| "off".to_string()));
-            }
-            if ui.button("DNS state").clicked() {
-                self.act("dns", |adb| settings::dns_state(adb));
-            }
-            if ui.button("block OTA").clicked() {
-                self.act("ota", |adb| settings::ota(adb, true).map(|_| "blocked".to_string()));
-            }
-            if ui.button("OTA state").clicked() {
-                self.act("ota", |adb| settings::ota_state(adb));
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("toggles");
-            for name in settings::TOGGLES.iter().map(|t| t.name) {
-                if ui.small_button(name).clicked() {
-                    self.act(name, move |adb| settings::toggle(adb, name, None));
+                if ui.button("Private DNS Off").clicked() {
+                    self.spawn(ctx, "adblock", |adb, _| settings::adblock_off(&adb).map(|_| "off".into()));
                 }
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("screens");
-            for name in device::SCREENS.iter().map(|(n, _)| *n) {
-                if ui.small_button(name).clicked() {
-                    self.act(name, move |adb| {
-                        device::screen(adb, name).map(|_| format!("opened {name}"))
-                    });
+                if ui.button("DNS State").clicked() {
+                    self.spawn(ctx, "dns", |adb, _| settings::dns_state(&adb));
                 }
-            }
-        });
-    }
-
-    fn screen_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Screen");
-        ui.horizontal(|ui| {
-            if ui.button("screenshot").clicked() {
-                let dest = std::env::temp_dir().join(SHOT);
-                let path = dest.display().to_string();
-                match screen::screenshot(&self.adb, &dest) {
-                    Ok(()) => self.say(format!("screenshot: saved {path}")),
-                    Err(e) => self.say(format!("screenshot: {e}")),
+                if ui.button("Block OTA").clicked() {
+                    self.spawn(ctx, "ota", |adb, _| settings::ota(&adb, true).map(|_| "blocked".into()));
                 }
-                self.preview(&dest, ui.ctx());
-            }
-            ui.label("record seconds");
-            ui.add(egui::TextEdit::singleline(&mut self.seconds).desired_width(60.0));
-            if ui.button("record").clicked() {
-                match self.seconds.trim().parse::<u32>() {
-                    Ok(secs) => {
-                        let dest = std::env::temp_dir().join("atvtools-record.mp4");
-                        let path = dest.display().to_string();
-                        self.act("record", move |adb| {
-                            screen::record(adb, secs, std::path::Path::new(&path))
-                                .map(|_| format!("saved {path}"))
+                if ui.button("OTA State").clicked() {
+                    self.spawn(ctx, "ota", |adb, _| settings::ota_state(&adb));
+                }
+            });
+        });
+        ui.add_space(6.0);
+        card(ui, |ui| {
+            ui.strong("System Toggles & TV Settings Screens");
+            ui.horizontal_wrapped(|ui| {
+                for name in settings::TOGGLES.iter().map(|t| t.name) {
+                    if ui.small_button(name).clicked() {
+                        self.spawn(ctx, name, move |adb, _| settings::toggle(&adb, name, None));
+                    }
+                }
+            });
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                for name in device::SCREENS.iter().map(|(n, _)| *n) {
+                    if ui.small_button(name).clicked() {
+                        self.spawn(ctx, name, move |adb, _| {
+                            device::screen(&adb, name).map(|_| format!("opened {name}"))
                         });
                     }
-                    Err(_) => self.say("record: enter a number of seconds"),
                 }
-            }
-            if ui.button("scrcpy (separate window)").clicked() {
-                match screen::scrcpy(self.adb.serial.as_deref(), &[]) {
-                    Ok(()) => self.say("scrcpy: closed"),
-                    Err(e) => self.say(format!("scrcpy: {e}")),
-                }
-            }
+            });
         });
-        if let Some(tex) = &self.shot {
-            ui.add(egui::Image::new(egui::load::SizedTexture::from_handle(tex)).max_width(420.0));
-        }
-        ui.separator();
-        ui.label("scrcpy mirrors the TV on this machine; it is an external binary (SCRCPY env var or PATH).");
     }
 
-    /// Decode the file we just pulled and put it on screen; the reader only
-    /// handles the shapes screencap emits, so an odd PNG just gets a note.
+    fn remote_screen_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Remote & Screen");
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            card(ui, |ui| {
+                ui.strong("D-Pad & Media Keys");
+                ui.horizontal_wrapped(|ui| {
+                    for (name, _) in device::KEYS {
+                        if ui.small_button(*name).clicked() {
+                            let key = name.to_string();
+                            self.spawn(ctx, *name, move |adb, _| {
+                                device::key(&adb, &[key]).map(|_| "sent".into())
+                            });
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Text");
+                    ui.add(egui::TextEdit::singleline(&mut self.text_in).desired_width(280.0));
+                    if ui.button("Send").clicked() {
+                        let words: Vec<String> = self.text_in.split_whitespace().map(str::to_string).collect();
+                        self.spawn(ctx, "text", move |adb, _| device::text(&adb, &words).map(|_| "typed".into()));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("URL");
+                    ui.add(egui::TextEdit::singleline(&mut self.url_in).desired_width(280.0));
+                    if ui.button("Open").clicked() {
+                        let url = self.url_in.clone();
+                        self.spawn(ctx, "open", move |adb, _| device::open_url(&adb, &url).map(|_| format!("opened {url}")));
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Wake").clicked() {
+                        self.spawn(ctx, "wake", |adb, _| device::wake(&adb).map(|_| "sent".into()));
+                    }
+                    if ui.button("Sleep").clicked() {
+                        self.spawn(ctx, "sleep", |adb, _| device::sleep(&adb).map(|_| "sent".into()));
+                    }
+                    if ui.button("Sync & Reboot").clicked() {
+                        self.spawn(ctx, "reboot", |adb, _| {
+                            let _ = tv_safety::pre_reboot_sync(&adb);
+                            device::reboot(&adb, None).map(|_| "synced and rebooted".into())
+                        });
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            card(ui, |ui| {
+                ui.strong("Screen Capture & Mirroring");
+                ui.horizontal(|ui| {
+                    if primary_button(ui, "Screenshot").clicked() {
+                        let dest = std::env::temp_dir().join(SHOT);
+                        self.spawn(ctx, "screenshot", move |adb, tx| {
+                            screen::screenshot(&adb, &dest)?;
+                            let p = dest.display().to_string();
+                            let _ = tx.send(WorkerMsg::Screenshot(dest));
+                            Ok(format!("saved {p}"))
+                        });
+                    }
+                    ui.label("Seconds");
+                    ui.add(egui::TextEdit::singleline(&mut self.seconds).desired_width(50.0));
+                    if ui.button("Record").clicked() {
+                        if let Ok(secs) = self.seconds.trim().parse::<u32>() {
+                            let dest = std::env::temp_dir().join("atvtools-record.mp4");
+                            self.spawn(ctx, "record", move |adb, _| {
+                                screen::record(&adb, secs, &dest)?;
+                                Ok(format!("saved {}", dest.display()))
+                            });
+                        } else {
+                            self.say("record: enter a number of seconds");
+                        }
+                    }
+                    if ui.button("Launch scrcpy").clicked() {
+                        self.spawn(ctx, "scrcpy", |adb, _| {
+                            screen::scrcpy(adb.serial.as_deref(), &[]).map(|_| "closed".into())
+                        });
+                    }
+                });
+                if let Some(tex) = &self.shot {
+                    ui.add_space(6.0);
+                    ui.add(egui::Image::new(egui::load::SizedTexture::from_handle(tex)).max_width(480.0));
+                }
+            });
+        });
+    }
+
+    fn files_catalog_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Files & App Catalog");
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            card(ui, |ui| {
+                ui.strong("File Transfer");
+                ui.horizontal(|ui| {
+                    ui.label("TV path");
+                    ui.add(egui::TextEdit::singleline(&mut self.remote_path).desired_width(280.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Local path");
+                    ui.add(egui::TextEdit::singleline(&mut self.local_path).desired_width(280.0));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("List TV Folder").clicked() {
+                        let remote = self.remote_path.clone();
+                        self.spawn(ctx, "ls", move |adb, _| Ok(transfer::ls(&adb, &remote)?.trim().to_string()));
+                    }
+                    if ui.button("Send to TV").clicked() {
+                        let remote = self.remote_path.clone();
+                        let local = PathBuf::from(self.local_path.clone());
+                        self.spawn(ctx, "push", move |adb, _| {
+                            transfer::push(&adb, &local, &remote)?;
+                            Ok(format!("sent {}", local.display()))
+                        });
+                    }
+                    if ui.button("Copy from TV").clicked() {
+                        let remote = self.remote_path.clone();
+                        let local = PathBuf::from(self.local_path.clone());
+                        self.spawn(ctx, "pull", move |adb, _| {
+                            transfer::pull(&adb, &remote, &local)?;
+                            Ok(format!("copied to {}", local.display()))
+                        });
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+            card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("Diagnostics & Utilities");
+                    if ui.button("Doctor").clicked() {
+                        self.spawn(ctx, "doctor", |adb, _| crate::doctor::run(&adb));
+                    }
+                    if ui.button("Doctor --fix").clicked() {
+                        self.spawn(ctx, "doctor --fix", |adb, _| crate::doctor::fix(&adb));
+                    }
+                    if ui.button("Device Info").clicked() {
+                        self.spawn(ctx, "info", |adb, _| {
+                            let rows = device::info(&adb)?;
+                            Ok(rows.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("  "))
+                        });
+                    }
+                    if ui.button("Optimize").clicked() {
+                        self.spawn(ctx, "optimize", |adb, _| device::optimize(&adb));
+                    }
+                    if ui.button("Check Updates").clicked() {
+                        self.spawn(ctx, "update", |_, _| crate::update::check(env!("CARGO_PKG_VERSION"), None));
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+            card(ui, |ui| {
+                ui.strong("APK Catalog");
+                for e in catalog::CATALOG {
+                    ui.horizontal(|ui| {
+                        let install = ui.small_button("Install").clicked();
+                        let replace = ui
+                            .small_button("Replace")
+                            .on_hover_text("Remove conflicting signature copy first")
+                            .clicked();
+                        if install || replace {
+                            let name = e.name.to_string();
+                            self.spawn(ctx, name.clone(), move |adb, _| {
+                                download::install_catalog_with(&adb, &name, replace)?;
+                                Ok(format!("installed {name}"))
+                            });
+                        }
+                        ui.monospace(e.name);
+                        ui.label(RichText::new(e.note).color(TEXT_MUTED).small());
+                    });
+                }
+            });
+        });
+    }
+
     fn preview(&mut self, path: &std::path::Path, ctx: &egui::Context) {
         self.shot = None;
         let Ok(bytes) = std::fs::read(path) else { return };
@@ -590,167 +1082,88 @@ impl App {
                 let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
                 self.shot = Some(ctx.load_texture("shot", image, egui::TextureOptions::LINEAR));
             }
-            None => self.say("preview: nothing to draw; open the file instead"),
-        }
-    }
-
-    fn remote_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Remote");
-        ui.horizontal_wrapped(|ui| {
-            for (name, _) in device::KEYS {
-                if ui.small_button(*name).clicked() {
-                    let key = name.to_string();
-                    self.act(name, move |adb| {
-                        device::key(adb, &[key]).map(|_| "sent".to_string())
-                    });
-                }
-            }
-        });
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("text");
-            ui.add(egui::TextEdit::singleline(&mut self.text_in).desired_width(320.0));
-            if ui.button("send").clicked() {
-                let words: Vec<String> = self.text_in.split_whitespace().map(|s| s.to_string()).collect();
-                self.act("text", move |adb| {
-                    device::text(adb, &words).map(|_| "typed".to_string())
-                });
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("url");
-            ui.add(egui::TextEdit::singleline(&mut self.url_in).desired_width(320.0));
-            if ui.button("open").clicked() {
-                let url = self.url_in.clone();
-                self.act("open", move |adb| {
-                    device::open_url(adb, &url).map(|_| format!("opened {url}"))
-                });
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("wake").clicked() {
-                self.act("wake", |adb| device::wake(adb).map(|_| "sent".to_string()));
-            }
-            if ui.button("sleep").clicked() {
-                self.act("sleep", |adb| device::sleep(adb).map(|_| "sent".to_string()));
-            }
-            if ui.button("reboot").clicked() {
-                self.act("reboot", |adb| device::reboot(adb, None).map(|_| "sent".to_string()));
-            }
-            if ui.button("notifications").clicked() {
-                self.act("notifications", |adb| {
-                    device::expand_notifications(adb).map(|_| "expanded".to_string())
-                });
-            }
-        });
-    }
-
-    fn helpers_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Helpers");
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("doctor").clicked() {
-                self.act("doctor", |adb| crate::doctor::run(adb));
-            }
-            if ui.button("doctor --fix").clicked() {
-                self.act("doctor --fix", |adb| crate::doctor::fix(adb));
-            }
-            if ui.button("device info").clicked() {
-                self.act("info", |adb| {
-                    let rows = device::info(adb)?;
-                    Ok(rows
-                        .iter()
-                        .map(|(k, v)| format!("{k}: {v}"))
-                        .collect::<Vec<_>>()
-                        .join("  "))
-                });
-            }
-            if ui.button("optimize (animations, cache)").clicked() {
-                self.act("optimize", |adb| {
-                    device::optimize(adb)
-                });
-            }
-            if ui.button("uad gui (universal debloater)").clicked() {
-                self.act("uad gui", |adb| uad::launch_gui(adb, false));
-            }
-            if ui.button("check for updates").clicked() {
-                self.act("update", |_adb| {
-                    crate::update::check(env!("CARGO_PKG_VERSION"), None)
-                });
-            }
-        });
-        ui.separator();
-        ui.label("Catalog: download and install on the TV");
-        for e in catalog::CATALOG {
-            ui.horizontal(|ui| {
-                let install = ui.small_button("install").clicked();
-                let replace = ui
-                    .small_button("replace")
-                    .on_hover_text("remove the other build of the same id first (official Shizuku -> fork)")
-                    .clicked();
-                if install || replace {
-                    let url = e.url.to_string();
-                    let name = e.name.to_string();
-                    let label = name.clone();
-                    self.act(&label, move |adb| {
-                        let abis = catalog::abis(adb);
-                        let abis: Vec<&str> = abis.iter().map(String::as_str).collect();
-                        let url = catalog::resolve(&url, &abis)?;
-                        let dest = std::env::temp_dir().join("atvtools").join(format!("{name}.apk"));
-                        download::fetch(&url, &dest)?;
-                        apps::install_with(adb, &[dest], replace)?;
-                        Ok(format!("installed {name}{}", if replace { " (replacing)" } else { "" }))
-                    });
-                }
-                ui.monospace(e.name);
-                ui.label(egui::RichText::new(e.note).small());
-            });
+            None => self.say("preview: unsupported PNG format; open file directly"),
         }
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let tab = self.tab;
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Connect, "Connect");
-                ui.selectable_value(&mut self.tab, Tab::Apps, "Apps");
-                ui.selectable_value(&mut self.tab, Tab::Files, "Files");
-                ui.selectable_value(&mut self.tab, Tab::Debloat, "Debloat");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
-                ui.selectable_value(&mut self.tab, Tab::Screen, "Screen");
-                ui.selectable_value(&mut self.tab, Tab::Remote, "Remote");
-                ui.selectable_value(&mut self.tab, Tab::Helpers, "Helpers");
-            });
-        });
-        egui::Panel::bottom("activity")
-            .resizable(true)
-            .default_size(150.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.strong("activity");
-                    if ui.small_button("clear").clicked() {
-                        self.log.clear();
+        let ctx = ui.ctx().clone();
+        self.drain_worker(&ctx);
+
+        // Top status bar
+        egui::Panel::top("header").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading(RichText::new("atvtools").strong());
+                let target = if self.serial_input.trim().is_empty() {
+                    "adb default"
+                } else {
+                    self.serial_input.trim()
+                };
+                badge(ui, target, if self.serial_input.trim().is_empty() { TEXT_MUTED } else { STATUS_OK });
+                if self.in_flight > 0 {
+                    ui.spinner();
+                    ui.label(RichText::new(&self.busy_label).color(ACCENT).small());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let toggle_label = if self.show_log { "Hide Log" } else { "Show Log" };
+                    if ui.small_button(toggle_label).clicked() {
+                        self.show_log = !self.show_log;
                     }
                 });
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for line in &self.log {
-                            ui.monospace(line);
+            });
+        });
+
+        // Left navigation sidebar
+        egui::Panel::left("nav").default_size(165.0).resizable(false).show(ui, |ui| {
+            ui.add_space(6.0);
+            for (tab, label) in Tab::ALL {
+                let selected = self.tab == tab;
+                let text = if selected {
+                    RichText::new(label).color(Color32::WHITE).strong()
+                } else {
+                    RichText::new(label).color(TEXT_MUTED)
+                };
+                if ui.selectable_label(selected, text).clicked() {
+                    self.tab = tab;
+                }
+            }
+        });
+
+        // Bottom activity drawer
+        if self.show_log {
+            egui::Panel::bottom("activity")
+                .resizable(true)
+                .default_size(135.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("Activity");
+                        if ui.small_button("Clear").clicked() {
+                            self.log.clear();
                         }
                     });
-            });
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for line in &self.log {
+                                ui.monospace(RichText::new(line).small());
+                            }
+                        });
+                });
+        }
+
+        // Main content
+        let tab = self.tab;
         egui::CentralPanel::default().show(ui, |ui| match tab {
-            Tab::Connect => self.connect_tab(ui),
-            Tab::Apps => self.apps_tab(ui),
-            Tab::Files => self.files_tab(ui),
-            Tab::Debloat => self.debloat_tab(ui),
-            Tab::Settings => self.settings_tab(ui),
-            Tab::Screen => self.screen_tab(ui),
-            Tab::Remote => self.remote_tab(ui),
-            Tab::Helpers => self.helpers_tab(ui),
+            Tab::Connect => self.connect_tab(ui, &ctx),
+            Tab::Cleanup => self.cleanup_tab(ui, &ctx),
+            Tab::Apps => self.apps_tab(ui, &ctx),
+            Tab::Debloat => self.debloat_tab(ui, &ctx),
+            Tab::Settings => self.settings_tab(ui, &ctx),
+            Tab::RemoteScreen => self.remote_screen_tab(ui, &ctx),
+            Tab::FilesCatalog => self.files_catalog_tab(ui, &ctx),
         });
     }
 }
@@ -774,7 +1187,7 @@ fn png_rgba(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
                 w = be32(body, 0)? as usize;
                 h = be32(body, 4)? as usize;
                 if body.get(8).copied() != Some(8) {
-                    return None; // palette or 16-bit: not what screencap writes
+                    return None;
                 }
                 channels = match body.get(9).copied()? {
                     2 => 3,
@@ -782,19 +1195,18 @@ fn png_rgba(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
                     _ => return None,
                 };
                 if body.get(12).copied() != Some(0) {
-                    return None; // interlaced
+                    return None;
                 }
             }
             b"IDAT" => idat.extend_from_slice(body),
             b"IEND" => break,
             _ => {}
         }
-        at += 12 + len; // length, kind, body, crc
+        at += 12 + len;
     }
     if w == 0 || h == 0 {
         return None;
     }
-    // IDAT is zlib-framed deflate; the raw variant is what the zip reader needs.
     let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&idat).ok()?;
     let stride = w * channels;
     let mut out = vec![0u8; w * h * 4];
@@ -860,15 +1272,15 @@ mod tests {
         let mut c = (body.len() as u32).to_be_bytes().to_vec();
         c.extend_from_slice(kind);
         c.extend_from_slice(body);
-        c.extend_from_slice(&[0, 0, 0, 0]); // the reader ignores CRCs
+        c.extend_from_slice(&[0, 0, 0, 0]);
         c
     }
 
     fn tiny_png() -> Vec<u8> {
         let mut ihdr = 2u32.to_be_bytes().to_vec();
         ihdr.extend_from_slice(&1u32.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA, no interlace
-        let raw = vec![0u8, 255, 0, 0, 255, 0, 255, 0, 255]; // filter byte + 2 pixels
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let raw = vec![0u8, 255, 0, 0, 255, 0, 255, 0, 255];
         let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
         png.extend(chunk(b"IHDR", &ihdr));
         png.extend(chunk(b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6)));
@@ -887,7 +1299,6 @@ mod tests {
     #[test]
     fn the_paeth_predictor_matches_the_spec() {
         assert_eq!(paeth(0, 0, 0), 0);
-        // a=10, b=20, c=15: pa=5, pb=5, pc=0, and the tie goes to c.
         assert_eq!(paeth(10, 20, 15), 15);
     }
 }
