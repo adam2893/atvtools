@@ -185,6 +185,37 @@ pub fn export(adb: &Adb) -> Result<String> {
 }
 
 /// The hostname out of `mode=hostname specifier=dns.adguard.com`.
+pub fn snapshots_dir() -> Option<PathBuf> {
+    crate::uad::home_dir().map(|h| h.join(".atvtools").join("snapshots"))
+}
+
+/// Save a timestamped TOML snapshot of the TV's current settings & disabled apps.
+pub fn save_snapshot(adb: &Adb) -> Result<PathBuf> {
+    let dir = snapshots_dir().ok_or_else(|| anyhow::anyhow!("no home directory for snapshots"))?;
+    std::fs::create_dir_all(&dir)?;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("snapshot-{secs}.atvtools.toml"));
+    let body = export(adb)?;
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
+/// Return the newest saved snapshot path, if any.
+pub fn latest_snapshot() -> Option<PathBuf> {
+    let dir = snapshots_dir()?;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+        .collect();
+    files.sort();
+    files.pop()
+}
+
 pub fn specifier(state: &str) -> Option<String> {
     let host = state
         .split_whitespace()

@@ -266,6 +266,60 @@ pub fn check_adb_secure(adb: &Adb) -> Option<String> {
     }
 }
 
+/// Read the TV's manufacturer/brand string for brand-specific preset matching.
+pub fn device_brand(adb: &Adb) -> String {
+    let mfg = adb.try_out(&["shell", "getprop ro.product.manufacturer"]);
+    let brand = adb.try_out(&["shell", "getprop ro.product.brand"]);
+    format!("{} {}", mfg.trim(), brand.trim()).trim().to_string()
+}
+
+/// Switch a USB-attached TV into TCP/IP mode on port 5555 and try to read its LAN IP.
+pub fn usb_to_wifi(adb: &Adb) -> Result<String> {
+    let tcp = adb.out(&["tcpip", "5555"])?;
+    let route = adb.try_out(&["shell", "ip route get 1.1.1.1"]);
+    let ip = route
+        .split_whitespace()
+        .skip_while(|t| *t != "src")
+        .nth(1)
+        .unwrap_or("<tv-ip>");
+    Ok(format!("{} — connect wirelessly at {ip}:5555", tcp.trim()))
+}
+
+/// Capture remote key events for ~4 seconds via `getevent -lt` so users can
+/// see exact keycodes and scancodes for remapping.
+pub fn read_last_key_event(adb: &Adb) -> Result<String> {
+    let out = adb.try_out(&["shell", "timeout 4 getevent -lt"]);
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("EV_KEY") || l.contains("MSC_SCAN") || l.contains("KEY_"))
+        .take(20)
+        .collect();
+    if lines.is_empty() {
+        Ok("No key events captured in 4s (press a remote button while scanning, or TV restricts getevent).".to_string())
+    } else {
+        Ok(lines.join("\n"))
+    }
+}
+
+/// Security audit summary for locking down ADB after cleanup.
+pub fn security_audit(adb: &Adb) -> String {
+    let mut notes = Vec::new();
+    if let Some(w) = check_adb_secure(adb) {
+        notes.push(format!("WARNING: {w}"));
+    } else {
+        notes.push("OK: ro.adb.secure=1 (ADB requires authorization prompt).".to_string());
+    }
+    let usb_dbg = adb.try_out(&["shell", "settings get global adb_enabled"]);
+    let wifi_dbg = adb.try_out(&["shell", "settings get global adb_wifi_enabled"]);
+    notes.push(format!(
+        "adb_enabled={}, adb_wifi_enabled={}",
+        usb_dbg.trim(),
+        wifi_dbg.trim()
+    ));
+    notes.push("When finished: open Developer Options on the TV and toggle off Wireless/Network debugging.".to_string());
+    notes.join("\n")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivacyCategory {
     Acr,

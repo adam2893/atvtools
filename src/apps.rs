@@ -66,11 +66,27 @@ pub fn install_with(adb: &Adb, apks: &[PathBuf], replace: bool) -> Result<()> {
             continue;
         }
         if !ok {
+            // Android 14+ or strict installers can hang/fail `adb install`; fall back to push + pm install.
+            if let Ok(msg) = install_via_shell(adb, apk) {
+                println!("{}: {msg}", apk.display());
+                continue;
+            }
             bail!("adb install -r -g {} failed: {out}", apk.display());
         }
         println!("{}: {}", apk.display(), out);
     }
     Ok(())
+}
+
+/// Fallback for Android 14+ installs where `adb install` hangs or is blocked:
+/// push APK to `/data/local/tmp` and run `pm install -r -g` over the shell.
+pub fn install_via_shell(adb: &Adb, apk: &Path) -> Result<String> {
+    let remote = "/data/local/tmp/atvtools_install.apk";
+    let local = apk.to_string_lossy().to_string();
+    adb.out(&["push", &local, remote])?;
+    let res = adb.out(&["shell", &format!("pm install -r -g {remote}")]);
+    let _ = adb.try_out(&["shell", &format!("rm -f {remote}")]);
+    res
 }
 
 /// The package named by INSTALL_FAILED_UPDATE_INCOMPATIBLE.
@@ -445,6 +461,17 @@ pub fn set_home(adb: &Adb, component: &str) -> Result<()> {
     let out = adb.try_out(&["shell", &format!("cmd package set-home-activity {component}")]);
     println!("{}", out.trim());
     Ok(())
+}
+
+/// Ask Android's PackageManager to trim app caches across the device.
+pub fn trim_caches(adb: &Adb) -> Result<String> {
+    adb.shell("pm trim-caches 999999999").map(|s| {
+        if s.trim().is_empty() {
+            "caches trimmed".into()
+        } else {
+            s.trim().into()
+        }
+    })
 }
 
 /// pm clear - wipes app data and cache (the script's "delete data and cache").

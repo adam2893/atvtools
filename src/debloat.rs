@@ -23,7 +23,72 @@ pub const PRESETS: &[Preset] = &[
         description: "Stock YouTube on Android TV (use SmartTube instead)",
         packages: &["com.google.android.youtube.tv"],
     },
+    Preset {
+        title: "tcl-bloat",
+        description: "TCL logkit & Samba ACR telemetry (keeps TV inputs & key service)",
+        packages: &["com.tcl.logkit", "tv.samba.ssm.ui", "com.google.android.feedback"],
+    },
+    Preset {
+        title: "xiaomi-patchwall",
+        description: "Xiaomi PatchWall home, ads & Mi TV analytics",
+        packages: &[
+            "com.mitv.tvhome",
+            "com.xiaomi.mitv.adv",
+            "com.xiaomi.mibox.lockscreen",
+            "com.miui.systemAdSolution",
+        ],
+    },
+    Preset {
+        title: "hisense-bloat",
+        description: "Hisense advertising & Inscape ACR tracking",
+        packages: &[
+            "com.hisense.tv.advertising",
+            "tv.inscape.tvclient.inscapeacr",
+        ],
+    },
+    Preset {
+        title: "sony-bravia",
+        description: "Sony Bravia demo mode, Samba ACR & promo services",
+        packages: &[
+            "tv.samba.ssm.ui",
+            "com.sony.dtv.demomode",
+            "com.sony.dtv.scmedia",
+        ],
+    },
+    Preset {
+        title: "philips-bloat",
+        description: "Philips DAC/GEL analytics, usage & framework loggers",
+        packages: &[
+            "org.droidtv.candeebug",
+            "org.droidtv.gel",
+            "org.droidtv.usagelogger",
+            "org.droidtv.tv.frameworklogger",
+        ],
+    },
+    Preset {
+        title: "shield-bloat",
+        description: "Nvidia Shield telemetry & diagnostic reporting",
+        packages: &["com.nvidia.stats", "com.nvidia.diagtools"],
+    },
 ];
+
+/// Match a TV manufacturer/brand string to recommended presets.
+pub fn presets_for_brand(brand: &str) -> Vec<&'static Preset> {
+    let b = brand.trim().to_ascii_lowercase();
+    PRESETS
+        .iter()
+        .filter(|p| match p.title {
+            "google-tv-ads" | "youtube-tv" => true,
+            "tcl-bloat" => b.contains("tcl"),
+            "xiaomi-patchwall" => b.contains("xiaomi") || b.contains("mi"),
+            "hisense-bloat" => b.contains("hisense"),
+            "sony-bravia" => b.contains("sony"),
+            "philips-bloat" => b.contains("philips") || b.contains("tpv"),
+            "shield-bloat" => b.contains("nvidia"),
+            _ => false,
+        })
+        .collect()
+}
 
 pub fn find(title: &str) -> Option<&'static Preset> {
     let t = title.trim().to_ascii_lowercase();

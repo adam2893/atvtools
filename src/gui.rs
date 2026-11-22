@@ -3,7 +3,7 @@
 
 use crate::adb::{Adb, Device};
 use crate::apps::{self, Scope};
-use crate::{catalog, debloat, device, download, net, screen, settings, shizuku, transfer, tv_safety, uad, undo};
+use crate::{catalog, debloat, device, download, net, profile, screen, settings, shizuku, transfer, tv_safety, uad, undo};
 use anyhow::Result;
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke};
 use std::path::PathBuf;
@@ -65,6 +65,8 @@ enum WorkerMsg {
     PrivacyFindings(Vec<tv_safety::PrivacyFinding>),
     Drift(tv_safety::DriftReport),
     Launchers(Vec<String>),
+    Brand(String),
+    Sizes(Vec<(String, u64, u64)>),
     Screenshot(PathBuf),
     SetTarget(String),
     Done(String),
@@ -184,6 +186,8 @@ struct App {
     privacy_findings: Vec<tv_safety::PrivacyFinding>,
     drift_report: Option<tv_safety::DriftReport>,
     launchers: Vec<String>,
+    detected_brand: String,
+    pkg_sizes: Vec<(String, u64, u64)>,
     helper_choice: HelperChoice,
     text_in: String,
     url_in: String,
@@ -223,6 +227,8 @@ impl App {
             privacy_findings: Vec::new(),
             drift_report: None,
             launchers: Vec::new(),
+            detected_brand: String::new(),
+            pkg_sizes: Vec::new(),
             helper_choice: HelperChoice::Shizuku,
             text_in: String::new(),
             url_in: String::new(),
@@ -296,6 +302,8 @@ impl App {
                 WorkerMsg::PrivacyFindings(f) => self.privacy_findings = f,
                 WorkerMsg::Drift(d) => self.drift_report = Some(d),
                 WorkerMsg::Launchers(l) => self.launchers = l,
+                WorkerMsg::Brand(b) => self.detected_brand = b,
+                WorkerMsg::Sizes(s) => self.pkg_sizes = s,
                 WorkerMsg::Screenshot(path) => self.preview(&path, ctx),
                 WorkerMsg::SetTarget(serial) => {
                     self.serial_input = serial.clone();
@@ -363,6 +371,9 @@ impl App {
                         let _ = tx.send(WorkerMsg::Devices(d));
                         Ok(format!("{count} attached"))
                     });
+                }
+                if ui.button("USB -> Wi-Fi (5555)").clicked() {
+                    self.spawn(ctx, "usb->wifi", |adb, _| tv_safety::usb_to_wifi(&adb));
                 }
             });
         });
@@ -481,9 +492,26 @@ impl App {
 
             // Step 2: Presets, Drift Check & Undo
             card(ui, |ui| {
-                ui.strong("2. Ad-Free Presets, OTA Drift & Undo");
+                ui.horizontal(|ui| {
+                    ui.strong("2. Ad-Free & Brand Presets, OTA Drift & Snapshots");
+                    if ui.small_button("Detect TV Brand").clicked() {
+                        self.spawn(ctx, "brand", |adb, tx| {
+                            let b = tv_safety::device_brand(&adb);
+                            let _ = tx.send(WorkerMsg::Brand(b.clone()));
+                            Ok(if b.is_empty() { "unknown brand".into() } else { b })
+                        });
+                    }
+                    if !self.detected_brand.is_empty() {
+                        badge(ui, &self.detected_brand, ACCENT);
+                    }
+                });
+                let presets = if self.detected_brand.is_empty() {
+                    debloat::PRESETS.iter().collect::<Vec<_>>()
+                } else {
+                    debloat::presets_for_brand(&self.detected_brand)
+                };
                 ui.horizontal_wrapped(|ui| {
-                    for preset in debloat::PRESETS {
+                    for preset in presets {
                         if ui.button(format!("Apply {}", preset.title)).clicked() {
                             let pkgs: Vec<String> = preset.packages.iter().map(|s| (*s).to_string()).collect();
                             let title = preset.title.to_string();
@@ -518,6 +546,22 @@ impl App {
                             apps::set_enabled(&adb, &rec.packages, true)?;
                             undo::retire(&rec.stamp);
                             Ok(format!("re-enabled {} package(s) from '{}'", rec.packages.len(), rec.what))
+                        });
+                    }
+                    if ui.button("Save Snapshot").clicked() {
+                        self.spawn(ctx, "snapshot save", |adb, _| {
+                            let p = profile::save_snapshot(&adb)?;
+                            Ok(format!("saved {}", p.display()))
+                        });
+                    }
+                    if ui.button("Restore Latest Snapshot").clicked() {
+                        self.spawn(ctx, "snapshot restore", |adb, _| {
+                            let Some(path) = profile::latest_snapshot() else {
+                                return Ok("no snapshots found in ~/.atvtools/snapshots".into());
+                            };
+                            let prof = profile::load(&path)?;
+                            profile::apply(&adb, &prof)?;
+                            Ok(format!("restored {}", path.display()))
                         });
                     }
                 });
@@ -600,6 +644,24 @@ impl App {
                     }
                 });
             });
+
+            ui.add_space(8.0);
+
+            // Step 4: Finish & Lock Down ADB
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("4. Finish & Lock Down ADB");
+                    if ui.button("Security Audit").clicked() {
+                        self.spawn(ctx, "security audit", |adb, _| Ok(tv_safety::security_audit(&adb)));
+                    }
+                    if ui.button("Open Developer Options on TV").clicked() {
+                        self.spawn(ctx, "dev options", |adb, _| {
+                            device::screen(&adb, "developer").map(|_| "opened Developer Options".into())
+                        });
+                    }
+                });
+                ui.label(RichText::new("When done cleaning your TV, turn off Network/Wireless debugging in Developer Options so port 5555 is not left open on your LAN.").color(TEXT_MUTED).small());
+            });
         });
     }
 
@@ -680,8 +742,32 @@ impl App {
                         Ok(out)
                     });
                 }
+                if ui.button("Analyze Sizes (Top 15)").clicked() {
+                    let scope = self.scope();
+                    self.spawn(ctx, "sizes", move |adb, tx| {
+                        let rows = apps::sizes(&adb, scope, 15)?;
+                        let n = rows.len();
+                        let _ = tx.send(WorkerMsg::Sizes(rows));
+                        Ok(format!("loaded top {n} package sizes"))
+                    });
+                }
+                if ui.button("Trim Caches").clicked() {
+                    self.spawn(ctx, "trim caches", |adb, _| apps::trim_caches(&adb));
+                }
             });
         });
+        if !self.pkg_sizes.is_empty() {
+            ui.add_space(4.0);
+            card(ui, |ui| {
+                ui.strong("Largest Packages (APK + Data)");
+                for (pkg, code, data) in &self.pkg_sizes {
+                    ui.horizontal(|ui| {
+                        ui.monospace(pkg);
+                        ui.label(RichText::new(format!("{} app + {} data", apps::mb(*code), apps::mb(*data))).color(TEXT_MUTED).small());
+                    });
+                }
+            });
+        }
         ui.add_space(6.0);
         if self.packages.is_empty() {
             card(ui, |ui| {
@@ -945,6 +1031,9 @@ impl App {
                             device::reboot(&adb, None).map(|_| "synced and rebooted".into())
                         });
                     }
+                    if ui.button("Inspect Remote Key (4s)").clicked() {
+                        self.spawn(ctx, "key inspector", |adb, _| tv_safety::read_last_key_event(&adb));
+                    }
                 });
             });
             ui.add_space(6.0);
@@ -1091,6 +1180,27 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_worker(&ctx);
+
+        // Drag-and-drop APK sideloading
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .filter(|p| {
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("apk"))
+                })
+                .collect()
+        });
+        if !dropped.is_empty() {
+            let count = dropped.len();
+            self.spawn(&ctx, format!("sideload {count} apk(s)"), move |adb, _| {
+                apps::install_with(&adb, &dropped, false)?;
+                Ok(format!("installed {count} APK(s)"))
+            });
+        }
 
         // Top status bar
         egui::Panel::top("header").show(ui, |ui| {
