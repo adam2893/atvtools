@@ -12,21 +12,23 @@ use std::sync::mpsc::{self, Receiver, Sender};
 const SHOT: &str = "atvtools-shot.png";
 const SCOPES: [&str; 3] = ["third-party", "system", "all"];
 
-// Locked design tokens: cool-slate neutral family + single blue accent.
-const BG_WINDOW: Color32 = Color32::from_rgb(15, 20, 25);
-const BG_PANEL: Color32 = Color32::from_rgb(20, 26, 33);
-const BG_CARD: Color32 = Color32::from_rgb(27, 34, 44);
-const BORDER_SUBTLE: Color32 = Color32::from_rgb(42, 52, 65);
-const TEXT_PRIMARY: Color32 = Color32::from_rgb(230, 237, 243);
-const TEXT_MUTED: Color32 = Color32::from_rgb(139, 148, 158);
+// Apple TV 4K-inspired OLED dark palette + single blue accent (anti-slop locked).
+const BG_WINDOW: Color32 = Color32::from_rgb(5, 6, 8);
+const BG_PANEL: Color32 = Color32::from_rgb(10, 12, 16);
+const BG_CARD: Color32 = Color32::from_rgb(18, 21, 28);
+const BG_DOCK: Color32 = Color32::from_rgb(22, 26, 34);
+const BORDER_SUBTLE: Color32 = Color32::from_rgb(38, 44, 54);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(238, 242, 246);
+const TEXT_MUTED: Color32 = Color32::from_rgb(140, 149, 162);
 const ACCENT: Color32 = Color32::from_rgb(59, 130, 246);
 const STATUS_OK: Color32 = Color32::from_rgb(34, 197, 94);
 const STATUS_WARN: Color32 = Color32::from_rgb(245, 158, 11);
 const STATUS_ERR: Color32 = Color32::from_rgb(239, 68, 68);
 
-const RADIUS_CARD: CornerRadius = CornerRadius::same(8);
-const RADIUS_CONTROL: CornerRadius = CornerRadius::same(6);
-const RADIUS_BADGE: CornerRadius = CornerRadius::same(10);
+const RADIUS_CARD: CornerRadius = CornerRadius::same(12);
+const RADIUS_DOCK: CornerRadius = CornerRadius::same(16);
+const RADIUS_CONTROL: CornerRadius = CornerRadius::same(8);
+const RADIUS_BADGE: CornerRadius = CornerRadius::same(12);
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -1443,50 +1445,103 @@ impl eframe::App for App {
             });
         }
 
-        // Top status bar
-        egui::Panel::top("header").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("atvtools").strong());
-                let target = if self.serial_input.trim().is_empty() {
-                    "adb default"
-                } else {
-                    self.serial_input.trim()
-                };
-                badge(ui, target, if self.serial_input.trim().is_empty() { TEXT_MUTED } else { STATUS_OK });
-                if self.in_flight > 0 {
-                    ui.spinner();
-                    ui.label(RichText::new(&self.busy_label).color(ACCENT).small());
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let toggle_label = if self.show_log { "Hide Log" } else { "Show Log" };
-                    if ui.small_button(toggle_label).clicked() {
-                        self.show_log = !self.show_log;
+        // Apple TV 4K-style top bar: thin title + target pill on left, frosted pills on right
+        egui::Panel::top("header")
+            .frame(egui::Frame::new().fill(BG_WINDOW).inner_margin(egui::Margin::symmetric(18, 12)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("atvtools").size(22.0).color(TEXT_PRIMARY).strong());
+                    ui.label(RichText::new("Take back your TV.").size(13.0).color(TEXT_MUTED));
+                    let target = if self.serial_input.trim().is_empty() {
+                        "adb default"
+                    } else {
+                        self.serial_input.trim()
+                    };
+                    badge(
+                        ui,
+                        target,
+                        if self.serial_input.trim().is_empty() { TEXT_MUTED } else { STATUS_OK },
+                    );
+                    if self.in_flight > 0 {
+                        ui.spinner();
+                        ui.label(RichText::new(&self.busy_label).color(ACCENT).small());
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let toggle_label = if self.show_log { "Hide Activity" } else { "Activity" };
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(toggle_label).small())
+                                    .fill(BG_DOCK)
+                                    .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                    .corner_radius(RADIUS_BADGE),
+                            )
+                            .clicked()
+                        {
+                            self.show_log = !self.show_log;
+                        }
+                        if let Some(h) = &self.health {
+                            badge(ui, &format!("Android {} · {} free", h.android, h.storage_free), ACCENT);
+                        }
+                    });
                 });
             });
-        });
 
-        // Left navigation sidebar
-        egui::Panel::left("nav").default_size(165.0).resizable(false).show(ui, |ui| {
-            ui.add_space(6.0);
-            for (tab, label) in Tab::ALL {
-                let selected = self.tab == tab;
-                let text = if selected {
-                    RichText::new(label).color(Color32::WHITE).strong()
-                } else {
-                    RichText::new(label).color(TEXT_MUTED)
-                };
-                if ui.selectable_label(selected, text).clicked() {
-                    self.tab = tab;
-                }
-            }
-        });
+        // Bottom frosted-glass Apple TV dock + optional activity drawer
+        egui::Panel::bottom("dock")
+            .frame(egui::Frame::new().fill(BG_WINDOW).inner_margin(egui::Margin::symmetric(18, 10)))
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    egui::Frame::new()
+                        .fill(BG_DOCK)
+                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                        .corner_radius(RADIUS_DOCK)
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (tab, label) in Tab::ALL {
+                                    let selected = self.tab == tab;
+                                    let fill = if selected {
+                                        ACCENT.linear_multiply(0.24)
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    };
+                                    let stroke = if selected {
+                                        Stroke::new(1.0, ACCENT.linear_multiply(0.75))
+                                    } else {
+                                        Stroke::NONE
+                                    };
+                                    let text = if selected {
+                                        RichText::new(label).color(Color32::WHITE).strong()
+                                    } else {
+                                        RichText::new(label).color(TEXT_MUTED)
+                                    };
+                                    if ui
+                                        .add(
+                                            egui::Button::new(text)
+                                                .fill(fill)
+                                                .stroke(stroke)
+                                                .corner_radius(RADIUS_BADGE),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.tab = tab;
+                                    }
+                                }
+                            });
+                        });
+                });
+            });
 
-        // Bottom activity drawer
         if self.show_log {
             egui::Panel::bottom("activity")
                 .resizable(true)
-                .default_size(135.0)
+                .default_size(115.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(BG_PANEL)
+                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                        .inner_margin(egui::Margin::symmetric(16, 8)),
+                )
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.strong("Activity");
