@@ -3,7 +3,7 @@
 
 use crate::adb::{Adb, Device};
 use crate::apps::{self, Scope};
-use crate::{catalog, debloat, device, download, net, profile, screen, settings, shizuku, transfer, tv_safety, uad, undo};
+use crate::{catalog, debloat, device, download, logs, net, profile, screen, settings, shizuku, transfer, tv_safety, uad, undo};
 use anyhow::Result;
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke};
 use std::path::PathBuf;
@@ -67,6 +67,7 @@ enum WorkerMsg {
     Launchers(Vec<String>),
     Brand(String),
     Sizes(Vec<(String, u64, u64)>),
+    LogOutput(String),
     Screenshot(PathBuf),
     SetTarget(String),
     Done(String),
@@ -193,6 +194,12 @@ struct App {
     url_in: String,
     dpi: String,
     scale: String,
+    dns_provider: usize,
+    nextdns_id: String,
+    log_tag: String,
+    log_grep: String,
+    diag_output: String,
+    fleet_all: bool,
     seconds: String,
     remote_path: String,
     local_path: String,
@@ -234,6 +241,12 @@ impl App {
             url_in: String::new(),
             dpi: String::new(),
             scale: String::new(),
+            dns_provider: 0,
+            nextdns_id: String::new(),
+            log_tag: String::new(),
+            log_grep: String::new(),
+            diag_output: String::new(),
+            fleet_all: false,
             seconds: "20".to_string(),
             remote_path: transfer::DOWNLOADS.to_string(),
             local_path: String::new(),
@@ -304,6 +317,7 @@ impl App {
                 WorkerMsg::Launchers(l) => self.launchers = l,
                 WorkerMsg::Brand(b) => self.detected_brand = b,
                 WorkerMsg::Sizes(s) => self.pkg_sizes = s,
+                WorkerMsg::LogOutput(s) => self.diag_output = s,
                 WorkerMsg::Screenshot(path) => self.preview(&path, ctx),
                 WorkerMsg::SetTarget(serial) => {
                     self.serial_input = serial.clone();
@@ -374,6 +388,9 @@ impl App {
                 }
                 if ui.button("USB -> Wi-Fi (5555)").clicked() {
                     self.spawn(ctx, "usb->wifi", |adb, _| tv_safety::usb_to_wifi(&adb));
+                }
+                if ui.button("Wake-on-LAN").clicked() {
+                    self.spawn(ctx, "wake-lan", |adb, _| device::wake_lan(&adb));
                 }
             });
         });
@@ -504,21 +521,34 @@ impl App {
                     if !self.detected_brand.is_empty() {
                         badge(ui, &self.detected_brand, ACCENT);
                     }
+                    ui.checkbox(&mut self.fleet_all, "Apply to all attached TVs");
                 });
                 let presets = if self.detected_brand.is_empty() {
                     debloat::PRESETS.iter().collect::<Vec<_>>()
                 } else {
                     debloat::presets_for_brand(&self.detected_brand)
                 };
+                let all_tvs = self.fleet_all;
                 ui.horizontal_wrapped(|ui| {
                     for preset in presets {
                         if ui.button(format!("Apply {}", preset.title)).clicked() {
                             let pkgs: Vec<String> = preset.packages.iter().map(|s| (*s).to_string()).collect();
                             let title = preset.title.to_string();
                             self.spawn(ctx, format!("preset {title}"), move |adb, _| {
-                                apps::set_enabled(&adb, &pkgs, false)?;
-                                let _ = undo::note(&format!("preset {title}"), adb.serial.as_deref(), &pkgs);
-                                Ok(format!("applied {title} (safe-guarded)"))
+                                if all_tvs {
+                                    let devs: Vec<_> = adb.devices()?.into_iter().filter(|d| d.state == "device").collect();
+                                    let count = devs.len();
+                                    for d in devs {
+                                        let dev_adb = Adb { serial: Some(d.serial), bin: adb.bin.clone() };
+                                        apps::set_enabled(&dev_adb, &pkgs, false)?;
+                                        let _ = undo::note(&format!("preset {title}"), dev_adb.serial.as_deref(), &pkgs);
+                                    }
+                                    Ok(format!("applied {title} to {count} TV(s)"))
+                                } else {
+                                    apps::set_enabled(&adb, &pkgs, false)?;
+                                    let _ = undo::note(&format!("preset {title}"), adb.serial.as_deref(), &pkgs);
+                                    Ok(format!("applied {title} (safe-guarded)"))
+                                }
                             });
                         }
                     }
@@ -941,13 +971,47 @@ impl App {
                     }
                 }
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Screen size");
+                if ui.button("Read Size").clicked() {
+                    self.spawn(ctx, "screen size", |adb, _| settings::screen_size(&adb));
+                }
+                if ui.button("Reset Size").clicked() {
+                    self.spawn(ctx, "screen size", |adb, _| settings::reset_screen_size(&adb).map(|_| "reset".into()));
+                }
+                ui.separator();
+                ui.label("Animations");
+                for (scale, label) in [(0.0, "0x Instant"), (0.5, "0.5x Snappy"), (1.0, "1.0x Stock")] {
+                    if ui.small_button(label).clicked() {
+                        self.spawn(ctx, "animations", move |adb, _| settings::set_animation_scales(&adb, scale));
+                    }
+                }
+            });
         });
         ui.add_space(6.0);
         card(ui, |ui| {
             ui.strong("Private DNS & OTA Updates");
             ui.horizontal_wrapped(|ui| {
-                if primary_button(ui, "AdGuard DNS On").clicked() {
-                    self.spawn(ctx, "adblock", |adb, _| settings::adblock_on(&adb).map(|_| settings::ADGUARD_DNS.into()));
+                ui.label("Provider");
+                let prov_name = settings::DNS_PROVIDERS[self.dns_provider].0;
+                egui::ComboBox::from_id_salt("dns-provider")
+                    .selected_text(prov_name)
+                    .show_ui(ui, |ui| {
+                        for (i, (name, _)) in settings::DNS_PROVIDERS.iter().enumerate() {
+                            ui.selectable_value(&mut self.dns_provider, i, *name);
+                        }
+                    });
+                if prov_name == "nextdns" {
+                    ui.label("Profile ID");
+                    ui.add(egui::TextEdit::singleline(&mut self.nextdns_id).desired_width(90.0).hint_text("abc123"));
+                }
+                if primary_button(ui, "Apply DNS").clicked() {
+                    let id = self.nextdns_id.clone();
+                    self.spawn(ctx, "dns", move |adb, _| {
+                        let host = settings::dns_host(prov_name, Some(&id))?;
+                        settings::set_dns(&adb, &host)?;
+                        Ok(host)
+                    });
                 }
                 if ui.button("Private DNS Off").clicked() {
                     self.spawn(ctx, "adblock", |adb, _| settings::adblock_off(&adb).map(|_| "off".into()));
@@ -1136,6 +1200,45 @@ impl App {
                         self.spawn(ctx, "update", |_, _| crate::update::check(env!("CARGO_PKG_VERSION"), None));
                     }
                 });
+            });
+
+            ui.add_space(6.0);
+            card(ui, |ui| {
+                ui.strong("Logs & Crash Viewer");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Tag");
+                    ui.add(egui::TextEdit::singleline(&mut self.log_tag).desired_width(110.0).hint_text("optional"));
+                    ui.label("Grep");
+                    ui.add(egui::TextEdit::singleline(&mut self.log_grep).desired_width(130.0).hint_text("filter text"));
+                    if ui.button("Dump Logcat (200)").clicked() {
+                        let tag = (!self.log_tag.trim().is_empty()).then(|| self.log_tag.trim().to_string());
+                        let grep = (!self.log_grep.trim().is_empty()).then(|| self.log_grep.trim().to_string());
+                        self.spawn(ctx, "logcat", move |adb, tx| {
+                            let out = logs::logcat(&adb, tag.as_deref(), grep.as_deref(), false, 200)?;
+                            let lines = out.lines().count();
+                            let _ = tx.send(WorkerMsg::LogOutput(out));
+                            Ok(format!("loaded {lines} line(s)"))
+                        });
+                    }
+                    if ui.button("Recent Crashes").clicked() {
+                        let grep = (!self.log_grep.trim().is_empty()).then(|| self.log_grep.trim().to_string());
+                        self.spawn(ctx, "crashes", move |adb, tx| {
+                            let out = logs::crash(&adb, grep.as_deref(), 200)?;
+                            let _ = tx.send(WorkerMsg::LogOutput(out));
+                            Ok("loaded crash dropbox".into())
+                        });
+                    }
+                    if ui.button("Save Bugreport").clicked() {
+                        let dir = std::env::temp_dir().join("atvtools-bugreport");
+                        self.spawn(ctx, "bugreport", move |adb, _| logs::bugreport(&adb, &dir));
+                    }
+                });
+                if !self.diag_output.is_empty() {
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                        ui.monospace(RichText::new(&self.diag_output).small());
+                    });
+                }
             });
 
             ui.add_space(6.0);

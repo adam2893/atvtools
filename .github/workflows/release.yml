@@ -59,6 +59,14 @@ jobs:
             target/aarch64-apple-darwin/release/atvtools \
             target/x86_64-apple-darwin/release/atvtools
           cp dist/atvtools dist/atvtools.app/Contents/MacOS/atvtools-bin
+          if [ -f assets/logo.png ]; then
+            mkdir -p AppIcon.iconset
+            for sz in 16 32 128 256 512; do
+              sips -z $sz $sz assets/logo.png --out AppIcon.iconset/icon_${sz}x${sz}.png >/dev/null
+              sips -z $((sz*2)) $((sz*2)) assets/logo.png --out AppIcon.iconset/icon_${sz}x${sz}@2x.png >/dev/null
+            done
+            iconutil -c icns AppIcon.iconset -o dist/atvtools.app/Contents/Resources/AppIcon.icns
+          fi
           cat > dist/atvtools.app/Contents/MacOS/atvtools << 'EOF'
           #!/bin/bash
           DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -71,6 +79,7 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>CFBundleExecutable</key><string>atvtools</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundleIdentifier</key><string>com.adam2893.atvtools</string>
             <key>CFBundleName</key><string>atvtools</string>
             <key>CFBundleVersion</key><string>${VERSION#v}</string>

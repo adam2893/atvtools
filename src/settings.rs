@@ -20,6 +20,30 @@ pub fn reset_density(adb: &Adb) -> Result<()> {
     Ok(())
 }
 
+pub fn screen_size(adb: &Adb) -> Result<String> {
+    Ok(first_after_colon(&adb.shell("wm size")?))
+}
+
+pub fn reset_screen_size(adb: &Adb) -> Result<()> {
+    adb.shell("wm size reset")?;
+    Ok(())
+}
+
+/// Set window, transition, and animator duration scales (0.0 = instant, 0.5 = snappy, 1.0 = stock).
+pub fn set_animation_scales(adb: &Adb, scale: f32) -> Result<String> {
+    if !(0.0..=2.0).contains(&scale) {
+        anyhow::bail!("animation scale must be between 0.0 and 2.0");
+    }
+    for key in [
+        "window_animation_scale",
+        "transition_animation_scale",
+        "animator_duration_scale",
+    ] {
+        adb.shell(&format!("settings put global {key} {scale}"))?;
+    }
+    Ok(format!("animation scales set to {scale}x"))
+}
+
 pub fn font_scale(adb: &Adb) -> Result<String> {
     Ok(adb.shell("settings get system font_scale")?.trim().to_string())
 }
